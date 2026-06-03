@@ -1,0 +1,24 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Hoval CAN",
+        "description": "Connect to your Hoval WLAN gateway (port 3113 CAN-BUS stream).",
+        "data": {
+          "host": "IP Address",
+          "port": "Port"
+        },
+        "data_description": {
+          "host": "IP address of the Hoval WLAN gateway on your local network.",
+          "port": "TCP port of the CAN-BUS stream (default: 3113)."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to the gateway. Check the IP address and that the device is reachable on port 3113."
+    },
+    "abort": {
+      "already_configured": "This gateway is already configured."
+    }
+  }
+}
