@@ -1,4 +1,4 @@
-"""Config flow for Hoval CAN."""
+"""Config flow and options flow for Hoval CAN."""
 from __future__ import annotations
 
 import asyncio
@@ -7,10 +7,11 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_HOST, CONF_PORT
+from homeassistant.core import callback
 
-from .const import DEFAULT_PORT, DOMAIN
+from .const import CONF_COP, COP_MAX, COP_MIN, DEFAULT_COP, DEFAULT_PORT, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,9 +42,14 @@ async def _test_connection(host: str, port: int) -> bool:
 
 
 class HovalCANConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Handle the initial setup UI for Hoval CAN."""
+    """Handle initial setup: IP address + port."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> HovalCANOptionsFlow:
+        return HovalCANOptionsFlow(config_entry)
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -54,7 +60,6 @@ class HovalCANConfigFlow(ConfigFlow, domain=DOMAIN):
             host = user_input[CONF_HOST].strip()
             port = user_input.get(CONF_PORT, DEFAULT_PORT)
 
-            # Prevent duplicate entries for the same gateway
             await self.async_set_unique_id(f"{host}:{port}")
             self._abort_if_unique_id_configured()
 
@@ -70,3 +75,30 @@ class HovalCANConfigFlow(ConfigFlow, domain=DOMAIN):
             data_schema=STEP_USER_SCHEMA,
             errors=errors,
         )
+
+
+class HovalCANOptionsFlow(OptionsFlow):
+    """Allow the user to change COP without removing the integration."""
+
+    def __init__(self, config_entry: ConfigEntry) -> None:
+        self._config_entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current_cop = float(
+            self._config_entry.options.get(CONF_COP, DEFAULT_COP)
+        )
+
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_COP, default=current_cop): vol.All(
+                    vol.Coerce(float),
+                    vol.Range(min=COP_MIN, max=COP_MAX),
+                ),
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)

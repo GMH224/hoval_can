@@ -1,7 +1,7 @@
 {
   "domain": "hoval_can",
   "name": "Hoval CAN",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "documentation": "https://github.com/GMH224/hoval_can",
   "issue_tracker": "https://github.com/GMH224/hoval_can/issues",
   "requirements": [],
