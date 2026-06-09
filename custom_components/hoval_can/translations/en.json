@@ -3,11 +3,8 @@
     "step": {
       "user": {
         "title": "Hoval CAN",
-        "description": "Connect to your Hoval WLAN gateway (CAN-BUS TCP stream on port 3113).",
-        "data": {
-          "host": "IP Address",
-          "port": "Port"
-        },
+        "description": "Connect to your Hoval WLAN gateway (CAN-BUS TCP stream, port 3113).",
+        "data": { "host": "IP Address", "port": "Port" },
         "data_description": {
           "host": "IP address of the Hoval WLAN gateway on your local network.",
           "port": "TCP port of the CAN-BUS stream (default: 3113)."
@@ -15,21 +12,17 @@
       }
     },
     "error": {
-      "cannot_connect": "Cannot connect to the gateway. Check the IP address and that the device is reachable on port 3113."
+      "cannot_connect": "Cannot connect. Check the IP address and that the device is reachable on port 3113."
     },
-    "abort": {
-      "already_configured": "This gateway is already configured."
-    }
+    "abort": { "already_configured": "This gateway is already configured." }
   },
   "options": {
     "step": {
       "init": {
         "title": "Hoval CAN Options",
-        "data": {
-          "cop": "COP (Coefficient of Performance)"
-        },
+        "data": { "heater_power_kw": "Electric Heater Rated Power (kW)" },
         "data_description": {
-          "cop": "Used to calculate heat pump electrical power and energy from thermal output. Typical range 2.0–8.0. Default: 6.3. Changing this value reloads the integration; accumulated energy totals are preserved."
+          "heater_power_kw": "Rated power of the electric DHW immersion heater (Heizstab). Common values: 2.0, 3.0, 6.0 kW. Default: 3.0 kW. Check the unit data plate. COP is calculated automatically from live sensor data and is not configurable here."
         }
       }
     }

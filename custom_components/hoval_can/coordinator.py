@@ -11,30 +11,15 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import (
-    CMD_READ_RESP_BE,
-    CMD_READ_RESP_LE,
-    CONF_COP,
-    DEFAULT_COP,
-    DEFAULT_PORT,
-    DOMAIN,
-    FRAME_END,
-    FRAME_SEP,
-    FRAME_TIMEOUT,
-    HEATER_DETECTION_MARGIN,
-    NULL_SENTINELS,
-    RECONNECT_DELAY,
-    SCHEDULE_GROUPS,
-    SENSOR_BY_DPID,
-    STRUCT_FMT,
-    TBYTES,
-    DP_DHW_ACTUAL,
-    DP_DHW_SETPOINT,
-    DP_STATUS_WW,
-    DP_HEAT_GEN,
-    DHW_STATUS_CHARGING,
-    connection_signal,
-    dp_signal,
-    heater_signal,
+    CMD_READ_RESP_BE, CMD_READ_RESP_LE,
+    CONF_HEATER_POWER, DEFAULT_HEATER_POWER_KW, DEFAULT_PORT,
+    DOMAIN, FRAME_END, FRAME_SEP, FRAME_TIMEOUT,
+    HEATER_DETECTION_MARGIN, NULL_SENTINELS, RECONNECT_DELAY,
+    SCHEDULE_GROUPS, SENSOR_BY_DPID, STRUCT_FMT, TBYTES,
+    DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_STATUS_WW,
+    DP_HEAT_GEN, DP_MODULATION, DHW_STATUS_CHARGING,
+    calculate_cop,
+    connection_signal, dp_signal, heater_signal,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -43,33 +28,45 @@ _LOGGER = logging.getLogger(__name__)
 class HovalCANCoordinator:
     """Manages the TCP connection to the Hoval WLAN gateway.
 
-    Parses incoming CAN-BUS frames and dispatches HA dispatcher signals so
-    sensor entities update themselves.  Strictly read-only — nothing is ever
-    written to the bus.
+    Parses incoming CAN-BUS frames and dispatches HA dispatcher signals.
+    Strictly read-only — nothing is ever written to the bus.
     """
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        self.hass = hass
-        self._entry = entry
-        self._host: str = entry.data["host"]
-        self._port: int = entry.data.get("port", DEFAULT_PORT)
-
+        self.hass        = hass
+        self._entry      = entry
+        self._host: str  = entry.data["host"]
+        self._port: int  = entry.data.get("port", DEFAULT_PORT)
         self._data: dict[int, Any] = {}
-        self._connected: bool = False
+        self._connected  = False
         self._task: asyncio.Task | None = None
-        self._stop: bool = False
+        self._stop       = False
         self._heater_on: bool | None = None
 
     # ── Public properties ─────────────────────────────────────────────────
 
     @property
     def cop(self) -> float:
-        """COP from options; default 6.3.  Re-read each time so sensor
-        always uses the most recently configured value."""
+        """Dynamic COP from live modulation and heat-generator temperature.
+
+        Two-regime piecewise model (see const.calculate_cop for details):
+          • T_gen ≤ 40 °C → space heating regime
+          • T_gen >  40 °C → DHW regime
+        Returns 0.0 when the heat pump is not running.
+        """
+        m = float(self._data.get(DP_MODULATION) or 0.0)
+        t = float(self._data.get(DP_HEAT_GEN)   or 0.0)
+        return calculate_cop(m, t)
+
+    @property
+    def heater_power_kw(self) -> float:
+        """Rated power of the electric DHW heater in kW (from options)."""
         try:
-            return float(self._entry.options.get(CONF_COP, DEFAULT_COP))
+            return float(
+                self._entry.options.get(CONF_HEATER_POWER, DEFAULT_HEATER_POWER_KW)
+            )
         except (TypeError, ValueError):
-            return DEFAULT_COP
+            return DEFAULT_HEATER_POWER_KW
 
     @property
     def connected(self) -> bool:
@@ -77,28 +74,22 @@ class HovalCANCoordinator:
 
     @property
     def electric_heater_on(self) -> bool | None:
-        """True when the electric DHW heater (Heizstab) is active.
+        """True when the Heizstab is active (derived — no direct DpId).
 
-        Detection logic — ON when ALL three conditions hold:
+        ON when all three hold:
+          1. DHW charging (status_ww == 8)
+          2. DHW below setpoint
+          3. Generator ≤ DHW + 5 °C  (heat pump can't heat the tank)
 
-          1. DHW regulation is actively charging  (status_ww == 8)
-          2. DHW temperature has not yet reached its setpoint
-          3. Heat generator temperature ≤ DHW temperature + margin
-             → the heat pump cannot heat the DHW tank; only the electric
-               element can raise the temperature in this state.
-
-        Winter safety: even when the heat pump runs for space heating at
-        40 °C, a 55 °C+ DHW tank is hotter than the generator, so
-        condition 3 fires correctly and the heater is detected as ON.
+        Winter-safe: heat pump at 40 °C for space heating cannot heat a
+        55 °C+ DHW tank; condition 3 fires correctly.
         """
         status_ww  = self._data.get(DP_STATUS_WW)
         dhw_actual = self._data.get(DP_DHW_ACTUAL)
         dhw_sp     = self._data.get(DP_DHW_SETPOINT)
         heat_gen   = self._data.get(DP_HEAT_GEN)
-
         if None in (status_ww, dhw_actual, dhw_sp, heat_gen):
-            return None   # insufficient data
-
+            return None
         return bool(
             status_ww == DHW_STATUS_CHARGING
             and dhw_actual < dhw_sp
@@ -106,7 +97,6 @@ class HovalCANCoordinator:
         )
 
     def get_value(self, dp_id: int) -> Any:
-        """Return the latest decoded value for *dp_id*, or None if unseen."""
         return self._data.get(dp_id)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
@@ -114,7 +104,8 @@ class HovalCANCoordinator:
     async def async_start(self) -> None:
         self._stop = False
         self._task = self.hass.loop.create_task(
-            self._connection_loop(), name=f"hoval_can_{self._entry.entry_id}"
+            self._connection_loop(),
+            name=f"hoval_can_{self._entry.entry_id}",
         )
 
     async def async_stop(self) -> None:
@@ -149,7 +140,7 @@ class HovalCANCoordinator:
             asyncio.open_connection(self._host, self._port), timeout=10
         )
         self._set_connected(True)
-        _LOGGER.info("Hoval CAN: connected to %s:%d", self._host, self._port)
+        _LOGGER.info("Hoval CAN: connected.")
         buf = b""
         try:
             while not self._stop:
@@ -158,9 +149,6 @@ class HovalCANCoordinator:
                         reader.read(4096), timeout=float(FRAME_TIMEOUT)
                     )
                 except asyncio.TimeoutError:
-                    _LOGGER.debug(
-                        "Hoval CAN: no data for %ds — still connected", FRAME_TIMEOUT
-                    )
                     continue
                 if not chunk:
                     raise ConnectionError("Device closed connection")
@@ -191,21 +179,18 @@ class HovalCANCoordinator:
 
         if cmd == CMD_READ_RESP_LE:
             if not (group & 0x8000):
-                return   # request frame, not a response
+                return
             if len(val) < 3 or val[0] != 0x00:
                 return
-            val = val[1:3]  # skip status byte; 2-byte LE value
+            val = val[1:3]
             little_endian = True
-
         elif cmd == CMD_READ_RESP_BE:
             if group in SCHEDULE_GROUPS:
                 return
             little_endian = False
-
         else:
-            return  # not a data frame
+            return
 
-        # Skip schedule dpId range
         if 64000 <= dp_id <= 64050:
             return
 
@@ -222,7 +207,7 @@ class HovalCANCoordinator:
                 pass
             return
 
-        value = self._decode_numeric(val, desc.typename, desc.decimal, little_endian)
+        value = _decode_numeric(val, desc.typename, desc.decimal, little_endian)
         if value is not None:
             self._update_dp(dp_id, value)
 
@@ -230,7 +215,6 @@ class HovalCANCoordinator:
         self._data[dp_id] = value
         async_dispatcher_send(self.hass, dp_signal(self._entry.entry_id, dp_id))
 
-        # Re-evaluate heater state whenever a dependent dpId changes
         if dp_id in (DP_STATUS_WW, DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_HEAT_GEN):
             new_state = self.electric_heater_on
             if new_state != self._heater_on:
@@ -246,25 +230,22 @@ class HovalCANCoordinator:
                 self.hass, connection_signal(self._entry.entry_id)
             )
 
-    # ── Value decoding ────────────────────────────────────────────────────
 
-    @staticmethod
-    def _decode_numeric(
-        raw: bytes,
-        typename: str,
-        decimal: int,
-        little_endian: bool = False,
-    ) -> float | int | None:
-        nb = TBYTES.get(typename, 0)
-        if nb == 0 or len(raw) < nb:
-            return None
-        raw = raw[:nb]
-        if raw == bytes([0xFF] * nb):
-            return None
-        fmt = STRUCT_FMT.get(typename)
-        if fmt is None:
-            return None
-        v = struct.unpack(("<" if little_endian else ">") + fmt, raw)[0]
-        if v in NULL_SENTINELS.get(typename, set()):
-            return None
-        return round(v / 10**decimal, decimal) if decimal > 0 else v
+# ── Numeric decoder (module-level for clarity) ────────────────────────────
+
+def _decode_numeric(
+    raw: bytes, typename: str, decimal: int, little_endian: bool = False
+) -> float | int | None:
+    nb = TBYTES.get(typename, 0)
+    if nb == 0 or len(raw) < nb:
+        return None
+    raw = raw[:nb]
+    if raw == bytes([0xFF] * nb):
+        return None
+    fmt = STRUCT_FMT.get(typename)
+    if fmt is None:
+        return None
+    v = struct.unpack(("<" if little_endian else ">") + fmt, raw)[0]
+    if v in NULL_SENTINELS.get(typename, set()):
+        return None
+    return round(v / 10**decimal, decimal) if decimal > 0 else v

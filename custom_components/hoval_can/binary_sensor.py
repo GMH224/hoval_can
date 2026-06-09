@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 from homeassistant.components.binary_sensor import (
-    BinarySensorDeviceClass,
-    BinarySensorEntity,
+    BinarySensorDeviceClass, BinarySensorEntity,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -20,37 +19,33 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator: HovalCANCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([HovalElectricHeaterBinarySensor(coordinator, entry)])
+    coord: HovalCANCoordinator = hass.data[DOMAIN][entry.entry_id]
+    async_add_entities([HovalElectricHeaterBinarySensor(coord, entry)])
 
 
 class HovalElectricHeaterBinarySensor(BinarySensorEntity):
-    """Binary sensor: True when the electric DHW heater (Heizstab) is active.
+    """True when the electric DHW heater (Heizstab) is active.
 
-    Detection logic (winter-safe):
-      ON when ALL of:
-        1. DHW regulation status == 8  (system is charging DHW)
-        2. DHW actual temperature < DHW setpoint  (target not yet reached)
-        3. Heat generator temperature <= DHW temperature + margin
-           (heat pump cannot be heating the DHW tank — it is not hot enough)
+    Detection: ON when all three hold simultaneously:
+      1. DHW Status == 8  (system is charging DHW tank)
+      2. DHW Temperature < DHW Setpoint  (target not yet reached)
+      3. Heat Generator Temp ≤ DHW Temp + 5 °C
+         (heat pump generator not hot enough to heat tank — electric only)
 
-    This correctly handles winter: even when the heat pump runs for space
-    heating at 40 °C, a 55 °C+ DHW tank remains hotter than the generator,
-    so condition 3 fires and the electric heater is correctly detected.
+    Winter-safe: even when the heat pump runs at 40 °C for space heating,
+    a 55 °C+ DHW tank is hotter than the generator; condition 3 fires.
     """
 
     _attr_has_entity_name = True
-    _attr_should_poll = False
-    _attr_device_class = BinarySensorDeviceClass.HEAT
-    _attr_icon = "mdi:water-boiler"
+    _attr_should_poll     = False
+    _attr_device_class    = BinarySensorDeviceClass.HEAT
+    _attr_icon            = "mdi:water-boiler"
 
-    def __init__(
-        self, coordinator: HovalCANCoordinator, entry: ConfigEntry
-    ) -> None:
-        self._coordinator = coordinator
+    def __init__(self, coord: HovalCANCoordinator, entry: ConfigEntry) -> None:
+        self._coord = coord
         self._entry = entry
-        self._attr_unique_id = f"{entry.entry_id}_electric_heater_active"
-        self._attr_name = "Electric Heater Active"
+        self._attr_unique_id  = f"{entry.entry_id}_electric_heater_active"
+        self._attr_name       = "Electric Heater Active"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
             name="Hoval CAN",
@@ -60,29 +55,21 @@ class HovalElectricHeaterBinarySensor(BinarySensorEntity):
         )
 
     async def async_added_to_hass(self) -> None:
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                heater_signal(self._entry.entry_id),
-                self._handle_update,
+        for sig in (
+            heater_signal(self._entry.entry_id),
+            connection_signal(self._entry.entry_id),
+        ):
+            self.async_on_remove(
+                async_dispatcher_connect(
+                    self.hass, sig,
+                    lambda: self.async_write_ha_state(),
+                )
             )
-        )
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                connection_signal(self._entry.entry_id),
-                self._handle_update,
-            )
-        )
-
-    @callback
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
 
     @property
     def is_on(self) -> bool | None:
-        return self._coordinator.electric_heater_on
+        return self._coord.electric_heater_on
 
     @property
     def available(self) -> bool:
-        return self._coordinator.connected
+        return self._coord.connected

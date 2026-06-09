@@ -1,246 +1,229 @@
 # Hoval CAN — Home Assistant Integration
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz)
-![Version](https://img.shields.io/badge/version-0.2.0-blue)
+![Version](https://img.shields.io/badge/version-0.2.1-blue)
 ![HA min version](https://img.shields.io/badge/HA-2023.1%2B-green)
 
-Local-push integration for Hoval heat pump systems equipped with the **WLAN Gateway**. Connects directly to the proprietary CAN-BUS TCP stream on port 3113 — no cloud, no Modbus module required. Strictly **read-only**: nothing is ever written to the bus.
-
----
-
-## How it works
-
-The Hoval WLAN gateway continuously broadcasts CAN-BUS frames on TCP port 3113. This integration connects to that stream, decodes every frame, and exposes the data as Home Assistant entities.
-
-Frame format (reverse-engineered from binary captures):
-```
-[FF 01] [3B header] [2B unit_id] [1B command] [2B group_id]
-        [2B datapoint_id] [value bytes] [FF 02]
-```
-Only command `0x42` (big-endian response) and `0x62` (little-endian response from the room display unit) carry sensor data. All other frame types are silently ignored.
-
----
-
-## Requirements
-
-| Requirement | Detail |
-|---|---|
-| Hardware | Hoval heat pump with **WLAN Gateway** module |
-| Home Assistant | 2023.1 or newer |
-| Network | HA must reach the gateway IP on TCP port 3113 |
-| Modbus module | **Not needed** |
+Local-push integration for Hoval heat pump systems with the **WLAN Gateway**. Connects to the proprietary CAN-BUS TCP stream on port 3113. No cloud, no Modbus module required. Strictly **read-only** — nothing is ever written to the bus.
 
 ---
 
 ## Installation
 
-### Via HACS (recommended)
-
+### Via HACS
 1. HACS → **Integrations** → ⋮ → **Custom repositories**
-2. Add `https://github.com/GMH224/hoval_can` — category **Integration**
-3. Find **Hoval CAN** and click **Download**
-4. Restart Home Assistant
+2. URL: `https://github.com/GMH224/hoval_can` — category **Integration**
+3. Download, restart HA
 
 ### Manual
-
-1. Copy `custom_components/hoval_can/` into your HA `custom_components/` directory
-2. Restart Home Assistant
+Copy `custom_components/hoval_can/` to your HA `custom_components/` directory, restart.
 
 ---
 
-## Configuration
+## Setup
 
-1. **Settings → Devices & Services → Add Integration → Hoval CAN**
-2. Enter the **IP address** of your WLAN gateway
-3. Leave port at **3113** unless your setup is non-standard
-4. HA tests the connection; if successful the integration is created
+**Settings → Devices & Services → Add Integration → Hoval CAN**
 
-All sensors start as **Unknown** and populate within ~60 seconds as the device broadcasts each value. Energy counters start at **0.0 kWh** on first install and accumulate from that point.
+Enter the gateway IP address. Port defaults to 3113. HA tests the connection before saving.
 
-### COP setting (Options)
+### Options (Configure button)
 
-After setup, click **Configure** on the integration card to adjust the COP:
+**Settings → Devices & Services → Hoval CAN → Configure**
 
-- **Settings → Devices & Services → Hoval CAN → Configure**
-- Enter the COP value (default **6.3**, range 1.0–15.0)
-- The integration reloads automatically; all accumulated energy totals are preserved
+| Option | Default | Range | Notes |
+|---|---|---|---|
+| **Electric Heater Rated Power** | 3.0 kW | 0.5–12.0 kW | Check unit data plate |
 
-The COP is used to calculate heat pump electrical power and energy from the thermal output (DpId=29051). Use your heat pump's seasonal or measured COP. A higher COP means less estimated electrical consumption for the same thermal output.
+COP is **not** configurable — it is calculated automatically from live sensor data (see below).
 
 ---
 
 ## Entities
 
-### Sensors
+### Sensors (48)
 
-#### Temperatures (7 sensors)
-| Name | DpId | Notes |
-|---|---|---|
-| Outdoor Temperature | 0 | Also received from room display unit (0x62) |
-| Room Temperature | 1 | |
-| Flow Temperature | 2 | |
-| DHW Temperature | 4 | Domestic hot water actual |
-| Heat Generator Temperature | 7 | Heat pump refrigerant cycle output |
-| Solar Storage Temperature | 16 | Disabled by default |
-| Circulation Temperature | 118 | Disabled by default; Unknown if sensor not fitted |
+#### Temperatures (7)
+`outdoor_temp`, `room_temp`, `flow_temp`, `dhw_temp`, `heat_gen_temp`, `solar_storage_temp`\*, `circulation_temp`\*
 
-#### Thermal Power & Performance (5 sensors)
-| Name | DpId | Notes |
-|---|---|---|
-| Heat Pump Power | 30 | % of rated capacity |
-| Power Limit | 8 | Configured power cap % |
-| Compressor Modulation | 20052 | % |
-| Current Heating Power | 29051 | kW thermal output — key input for electrical calculations |
-| WEZ Switch Cycles | 2080 | Cumulative compressor starts |
+\* Disabled by default.
 
-#### Electrical Power & Energy (6 sensors, new in v0.2)
-| Name | Unit | Notes |
-|---|---|---|
-| **Heat Pump Electrical Power** | kW | `thermal_kW / COP` — instantaneous |
-| **Heat Pump Electrical Energy** | kWh | Cumulative; persistent; 3 decimals |
-| **Electric Heater Power** | kW | 3.0 kW when on, 0.0 when off |
-| **Electric Heater Energy** | kWh | Cumulative; persistent; 3 decimals |
-| **Total Electrical Power** | kW | HP + heater combined instantaneous |
-| **Total Electrical Energy** | kWh | HP + heater combined cumulative; persistent; 3 decimals |
+#### Thermal Power & Performance (5)
+`heat_pump_power` (%), `power_limit` (%), `compressor_modulation` (%), `current_heating_power` (kW), `wez_switch_cycles`
 
-All three energy sensors are `state_class: total_increasing` and suitable for the **HA Energy Dashboard**.
-
-#### Hardware Energy Counter (1 sensor)
-| Name | DpId | Notes |
-|---|---|---|
-| Total WEZ Electrical Energy | 23009 | MWh; sourced directly from the device hardware counter |
-
-#### Status (7 sensors)
-| Name | DpId | Notes |
-|---|---|---|
-| Heating Circuit Status | 2051 | 0 = idle |
-| DHW Status | 2052 | **8 = DHW charging** — key for heater detection |
-| Heat Pump Status | 2053 | 0 = off, 1 = running |
-| Operating Status | 34 | |
-| WEZ Operating Message | 20053 | |
-| Smart Grid Status | 38012 | |
-| WEZ FA Status | 20051 | Diagnostic; disabled by default |
-
-#### Setpoints (11 sensors)
-Room Setpoint, Flow Setpoint, DHW Setpoint, Heat Generator Setpoint, Normal Room Temperature, Economy Room Temperature, Normal Room Temperature HC2 (disabled by default), Normal DHW Setpoint, Economy DHW Setpoint, Constant Heating Flow Setpoint (disabled by default), Constant Cooling Flow Setpoint (disabled by default).
-
-#### Operating Modes (3 sensors)
-Control Strategy, Heating Operating Mode, Heat Pump Operating Mode.
-
-#### Firmware Extensions (2 sensors)
-Active Heating Program (string, e.g. "Summer"), Heating Circuit Name (string, e.g. "Bodenheizung"). Not in the official April 2026 datapoint list.
-
-### Binary Sensor (1)
-
-| Name | Notes |
+#### Dynamic COP (1) — new in v0.2.1
+| Entity | Notes |
 |---|---|
-| **Electric Heater Active** | True when the electric DHW heater (Heizstab) is running |
+| `sensor.hoval_can_heat_pump_cop` | Live calculated COP; 0.0 when not running |
+
+#### Electrical Power & Energy (6) — new in v0.2
+| Entity | Unit | Persists |
+|---|---|---|
+| `sensor.hoval_can_heat_pump_electrical_power` | kW | — |
+| `sensor.hoval_can_heat_pump_electrical_energy` | kWh | ✅ |
+| `sensor.hoval_can_electric_heater_power` | kW | — |
+| `sensor.hoval_can_electric_heater_energy` | kWh | ✅ |
+| `sensor.hoval_can_total_electrical_power` | kW | — |
+| `sensor.hoval_can_total_electrical_energy` | kWh | ✅ |
+
+#### Hardware Counter (1)
+`sensor.hoval_can_total_wez_electrical_energy` (MWh, from device — persistent)
+
+#### Status, Setpoints, Modes, Firmware extensions
+See entity registry after installation.
+
+### Binary Sensor
+`binary_sensor.hoval_can_electric_heater_active` — True when Heizstab is running.
 
 ---
 
-## Electric heater detection
+## Dynamic COP Calculation
 
-The electric immersion heater (Heizstab / Zusatzheizung) does **not** broadcast a status on the CAN-BUS stream. Its state is derived from stream data.
+COP is calculated automatically from two live sensor values — **no HA template helper needed**.
 
-**Detection logic — ON when all three are true:**
+### Source entities
+| Variable | Entity | DpId |
+|---|---|---|
+| `m` — modulation % | `sensor.hoval_can_compressor_modulation` | 20052 |
+| `t` — heat generator °C | `sensor.hoval_can_heat_generator_temperature` | 7 |
 
-1. `DHW Status == 8` — system is actively charging the DHW tank
-2. `DHW Temperature < DHW Setpoint` — target has not been reached
-3. `Heat Generator Temperature ≤ DHW Temperature + 5 °C` — the heat pump's generator is not hot enough to heat the DHW tank; only the electric element can raise it
+### Two-regime formula
 
-**Winter safety:** In winter the heat pump may run for space heating at 40 °C flow temperature. A DHW tank at 55 °C+ is already hotter than the generator, so the heat pump physically cannot heat it. Condition 3 fires correctly regardless of what the heat pump is doing for space heating.
+**Guard-rails:** if `m ≤ 1` or `t ≤ 12.5 °C` → COP = 0.0 (heat pump off / cold start)
 
-**Verification:** Confirmed against binary captures of a full 62 °C DHW heating cycle (June 2026). The heat pump ran DHW to ~52 °C, then stopped. DHW continued rising at ~2.5 °C / 17 min → implied power ~2.9 kW ≈ 3 kW electric element confirmed.
+**Space Heating regime** (t ≤ 40 °C) — low temperature lift:
+```
+cop_base = 0.5833 × m            if m < 12
+         = 7.0                   if 12 ≤ m ≤ 22
+         = 7.988 − 0.0449 × m   if m > 22
+
+COP = cop_base × (17.5 / (t − 12.5))
+```
+Reference: lift = 17.5 °C → t_gen = 30 °C
+
+**DHW regime** (t > 40 °C) — high temperature lift:
+```
+cop_base = 4.626 − 0.0417 × m   if m ≤ 33
+         = 3.679 − 0.0130 × m   if 33 < m ≤ 60
+         = 3.500 − 0.0100 × m   if m > 60
+
+COP = cop_base × (39.5 / (t − 12.5))
+```
+Reference: lift = 39.5 °C → t_gen = 52 °C
+
+Final result clamped to [1.0, 8.5].
+
+### Verification template (optional cross-check)
+
+To verify the integration's COP against raw HA values, add to `configuration.yaml`:
+
+```yaml
+template:
+  - sensor:
+      - name: "Hoval COP Verification"
+        unique_id: hoval_cop_verification
+        unit_of_measurement: "COP"
+        state_class: measurement
+        icon: mdi:heating-coil
+        state: >
+          {% set m = states('sensor.hoval_can_compressor_modulation') | float(0) %}
+          {% set t = states('sensor.hoval_can_heat_generator_temperature') | float(0) %}
+          {% set t_source = 12.5 %}
+          {% if m <= 1 or t <= t_source %}
+            0.0
+          {% else %}
+            {% set lift = t - t_source %}
+            {% if t <= 40 %}
+              {% if m < 12 %}
+                {% set cop_base = 0.5833 * m %}
+              {% elif m <= 22 %}
+                {% set cop_base = 7.0 %}
+              {% else %}
+                {% set cop_base = 7.988 - (0.0449 * m) %}
+              {% endif %}
+              {{ (cop_base * (17.5 / lift)) | max(1.0) | min(8.5) | round(4) }}
+            {% else %}
+              {% if m <= 33 %}
+                {% set cop_base = 4.626 - (0.0417 * m) %}
+              {% elif m <= 60 %}
+                {% set cop_base = 3.679 - (0.0130 * m) %}
+              {% else %}
+                {% set cop_base = 3.500 - (0.0100 * m) %}
+              {% endif %}
+              {{ (cop_base * (39.5 / lift)) | max(1.0) | min(8.5) | round(4) }}
+            {% endif %}
+          {% endif %}
+        availability: >
+          {{ has_value('sensor.hoval_can_compressor_modulation') and
+             has_value('sensor.hoval_can_heat_generator_temperature') }}
+```
+
+This should always match `sensor.hoval_can_heat_pump_cop` — it is the same formula using the same source entities.
+
+### Physical basis
+
+The formula models two distinct operating regimes with live temperature-lift correction:
+
+- **cop_base** captures the heat pump's efficiency curve as a function of compressor loading
+- **Lift ratio** (reference_lift / actual_lift) corrects for actual operating conditions — higher lift reduces COP, lower lift improves it, matching the second law of thermodynamics
+- **Regime split at 40 °C** separates efficient floor-heating operation from high-temperature DHW mode
 
 ---
 
-## Electrical energy calculation
+## Electrical Energy Calculation
 
 ### Heat pump
-
 ```
-elec_power_kW = thermal_power_kW / COP
-elec_energy   += elec_power_kW × elapsed_hours   (left Riemann sum)
+elec_power  = thermal_kW / COP(m, T_gen)   [0 when COP=0]
+elec_energy += elec_power × elapsed_hours   (left Riemann sum, ~2 s intervals)
 ```
-
-DpId=29051 updates approximately every 2 seconds, so the integration is highly accurate. If DpId=29051 returns None (connection lost or null sentinel), the running period is abandoned so no spurious energy accumulates across reconnections.
+COP at the start of each interval is stored so accuracy is maintained when COP changes between updates.
 
 ### Electric heater
-
 ```
-elec_power_kW  = 3.0 kW  (when heater is active)
-elec_energy    += 3.0 × elapsed_hours
-```
-
-### Total electrical
-
-```
-total_power_kW  = HP_elec_power + heater_power
-total_energy    += total_power_kW × elapsed_hours
+elec_power  = heater_rated_kW   (when heater active)
+elec_energy += elec_power × elapsed_hours
 ```
 
-The total energy counter is independent — not a sum of the two sub-counters — so it persists and restores correctly on its own.
+### Total
+Independent counter — not a runtime sum of sub-sensors.
+
+### HA Energy Dashboard
+Add individually under **Settings → Energy → Individual devices**:
+- `sensor.hoval_can_heat_pump_electrical_energy`
+- `sensor.hoval_can_electric_heater_energy`
+- `sensor.hoval_can_total_electrical_energy`
 
 ---
 
-## Persistence and HA Energy Dashboard
+## Electric Heater Detection
 
-The following sensors survive HA restarts via `RestoreEntity`:
+The Heizstab has no direct CAN-BUS datapoint. Detected as ON when:
 
-| Sensor | Restore behaviour |
-|---|---|
-| Total WEZ Electrical Energy | Restores last known value; refreshed from device within ~60 s |
-| Heat Pump Electrical Energy | Restores accumulated total; continues from where it left off |
-| Electric Heater Energy | Restores accumulated total; continues from where it left off |
-| Total Electrical Energy | Restores accumulated total; continues from where it left off |
+1. DHW Status == 8 (DHW charging active)
+2. DHW Temperature < DHW Setpoint
+3. Heat Generator Temp ≤ DHW Temp + 5 °C (pump generator too cool to heat tank)
 
-To add to the Energy Dashboard: **Settings → Energy → Individual devices** → add each energy sensor.
-
----
-
-## Limitations
-
-- **Read-only.** No setpoints or commands are written to the bus.
-- Modbus TCP (port 502) is not available with the WLAN gateway — only the CAN-BUS stream (port 3113) is exposed.
-- The COP value is fixed per configuration. The actual instantaneous COP varies with outdoor temperature, load, and defrost cycles. Using a seasonal average COP gives a reasonable cumulative estimate but will be inaccurate for individual short periods.
-- Electric heater energy starts from zero on first install. Historical energy before installation is not recoverable.
-- Firmware-extension DatapointIds (502, 4005, etc.) may change between Hoval firmware versions.
-
----
-
-## Tested with
-
-- Hoval TopTronic E heat pump (WEZ), floor heating + DHW
-- WLAN Gateway module (firmware observed May–June 2026)
-- Home Assistant 2024.x
+**Winter-safe:** heat pump at 40 °C for space heating cannot heat a 55 °C+ DHW tank; condition 3 fires correctly. Verified against a full 62 °C DHW capture.
 
 ---
 
 ## Changelog
 
+### v0.2.1
+- **Dynamic COP** replaces fixed configurable COP. Calculated from `compressor_modulation` and `heat_generator_temperature` using a two-regime piecewise model with live temperature-lift correction
+- New sensor: `sensor.hoval_can_heat_pump_cop`
+- **Electric Heater Rated Power** now configurable via Configure menu (0.5–12.0 kW, default 3.0 kW)
+- COP removed from options — it is now fully automatic
+
 ### v0.2.0
-- Added **Heat Pump Electrical Power** and **Heat Pump Electrical Energy** sensors (derived via COP)
-- Added **Total Electrical Power** and **Total Electrical Energy** sensors
-- Added **Options flow**: configure COP via the HA UI without reinstalling
-- COP default: 6.3, range 1.0–15.0
-- All three electrical energy sensors are persistent (RestoreEntity, TOTAL_INCREASING)
-- Integration reloads automatically when COP is changed; energy totals are preserved
+- Heat Pump Electrical Power/Energy, Total Electrical Power/Energy
+- Options flow (configurable COP — superseded in v0.2.1)
+- All energy sensors persistent
 
-### v0.1.1
-- Fixed `Total WEZ Electrical Energy` (DpId=23009) persistence across restarts
-- Fixed `Electric Heater Energy` always starting at 0.0 (not Unknown) on first install
-- Fixed heater energy holding last value (not reverting to Unknown) when source dpIds temporarily unavailable
-- Bumped version to 0.1.1
-
-### v0.1.0
-- Initial release
-- 40 datapoint-based sensors (temperatures, status, setpoints, operating modes)
-- Electric Heater Active binary sensor
-- Electric Heater Power and Electric Heater Energy sensors
-- IP address configured via HA setup flow
+### v0.1.x
+- Initial release, persistent energy fixes
 
 ---
 
 ## License
-
 MIT

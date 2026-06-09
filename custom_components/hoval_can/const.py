@@ -7,24 +7,24 @@ from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 from homeassistant.const import EntityCategory
 
 DOMAIN = "hoval_can"
-DEFAULT_PORT = 3113
-RECONNECT_DELAY = 10      # seconds between reconnect attempts
-FRAME_TIMEOUT = 30        # seconds of silence before considering stream stale
+DEFAULT_PORT      = 3113
+RECONNECT_DELAY   = 10    # s between reconnect attempts
+FRAME_TIMEOUT     = 30    # s of silence before treating stream as stale
 
-# ── Options ────────────────────────────────────────────────────────────────
-CONF_COP = "cop"
-DEFAULT_COP = 6.3         # Coefficient of Performance (thermal out / elec in)
-COP_MIN = 1.0
-COP_MAX = 15.0
+# ── Configurable options ───────────────────────────────────────────────────
+# COP is calculated dynamically from live sensor data — not user-configurable.
+CONF_HEATER_POWER     = "heater_power_kw"
+DEFAULT_HEATER_POWER_KW: float = 3.0   # Rated power of the electric DHW heater
+HEATER_POWER_MIN      = 0.5            # kW
+HEATER_POWER_MAX      = 12.0           # kW  (dual-element upper bound)
 
-# ── Protocol ──────────────────────────────────────────────────────────────
-FRAME_SEP = b"\xff\x01"   # between frames
-FRAME_END = b"\xff\x02"   # end-of-frame marker
+# ── CAN-BUS protocol ──────────────────────────────────────────────────────
+FRAME_SEP = b"\xff\x01"
+FRAME_END = b"\xff\x02"
 
-CMD_READ_RESP_BE = 0x42   # Read response, big-endian value    ← data
-CMD_READ_RESP_LE = 0x62   # Read response, little-endian       ← data (room unit)
+CMD_READ_RESP_BE = 0x42   # Big-endian response    ← data
+CMD_READ_RESP_LE = 0x62   # Little-endian response ← data (room display)
 
-# Groups carrying time-schedule data — skip for sensor decoding
 SCHEDULE_GROUPS = {15614, 15922, 15923, 15924}
 
 # ── Type system ───────────────────────────────────────────────────────────
@@ -51,23 +51,92 @@ NULL_SENTINELS: dict[str, set] = {
     "S64": {-9223372036854775808},
 }
 
-# ── Electric heater ────────────────────────────────────────────────────────
-# Rated power of the Heizstab, verified empirically:
-# 280 L × 4186 J/kg·K × 2.5 °C ÷ (17 min × 60 s) ≈ 2.9 kW ≈ 3 kW
-HEATER_RATED_POWER_KW: float = 3.0
+# ── Electric heater detection ──────────────────────────────────────────────
+HEATER_DETECTION_MARGIN: float = 5.0   # °C
 
-# Heat pump generator must be hotter than DHW by at least this margin
-# for the heat pump to be doing the DHW heating (not the electric element)
-HEATER_DETECTION_MARGIN: float = 5.0
-
-# DatapointIds used by detection and energy calculation
-DP_DHW_ACTUAL      = 4       # Warmwasser-Ist       S16 dec=1 °C
-DP_DHW_SETPOINT    = 1004    # Warmwasser-Soll      S16 dec=1 °C
-DP_STATUS_WW       = 2052    # Status Warmwasserregelung  U8 (8 = charging)
-DP_HEAT_GEN        = 7       # Wärmeerzeuger-Ist    S16 dec=1 °C
+# Key DatapointIds
+DP_DHW_ACTUAL      = 4       # Warmwasser-Ist        S16 dec=1 °C
+DP_DHW_SETPOINT    = 1004    # Warmwasser-Soll       S16 dec=1 °C
+DP_STATUS_WW       = 2052    # Status WW             U8  (8 = charging)
+DP_HEAT_GEN        = 7       # Wärmeerzeuger-Ist     S16 dec=1 °C  ← COP input
 DP_THERMAL_POWER   = 29051   # Current Heating Power U32 dec=1 kW
+DP_MODULATION      = 20052   # Compressor Modulation U8  %         ← COP input
 
-DHW_STATUS_CHARGING = 8      # DP_STATUS_WW value when DHW demand is active
+DHW_STATUS_CHARGING = 8
+
+# ── Dynamic COP formula ───────────────────────────────────────────────────
+# Two-regime model using live temperature lift.
+#
+# COP inputs:
+#   m      = compressor modulation %     (DpId 20052 → sensor.hoval_can_compressor_modulation)
+#   t      = heat generator temperature °C (DpId 7 → sensor.hoval_can_heat_generator_temperature)
+#
+# Regime selection: t ≤ 40 °C → Space Heating;  t > 40 °C → DHW
+#
+# Lift correction: COP scales inversely with temperature lift (t − t_source).
+#   Space heating reference lift : 17.5 °C  → t_gen reference = 30 °C
+#   DHW reference lift            : 39.5 °C  → t_gen reference = 52 °C
+#
+# Guard-rails:
+#   m ≤ 1  or  t ≤ t_source  →  return 0.0  (heat pump off / cold start)
+#   Final COP clamped to [COP_MIN, COP_MAX]
+
+COP_SOURCE_TEMP: float  = 12.5   # °C — heat source temperature (ground/air)
+COP_SH_LIFT_REF: float  = 17.5   # °C — space heating reference lift
+COP_DHW_LIFT_REF: float = 39.5   # °C — DHW reference lift
+COP_SH_MAX_TGEN: float  = 40.0   # °C — T_gen threshold between regimes
+COP_CLAMP_MIN: float    = 1.0
+COP_CLAMP_MAX: float    = 8.5
+
+
+def calculate_cop(modulation: float, heat_gen_temp: float) -> float:
+    """Dynamic COP from compressor modulation and heat generator temperature.
+
+    Two-regime piecewise model calibrated against real operating data.
+    Faithfully implements the user-provided HA template formula.
+
+    Space Heating (heat_gen_temp ≤ 40 °C):
+        cop_base = 0.5833×m           if m < 12
+                 = 7.0                if 12 ≤ m ≤ 22
+                 = 7.988 − 0.0449×m  if m > 22
+        COP = cop_base × (17.5 / lift)
+
+    DHW (heat_gen_temp > 40 °C):
+        cop_base = 4.626 − 0.0417×m  if m ≤ 33
+                 = 3.679 − 0.0130×m  if 33 < m ≤ 60
+                 = 3.500 − 0.0100×m  if m > 60
+        COP = cop_base × (39.5 / lift)
+
+    Returns 0.0 when the heat pump is not running (m ≤ 1) or during a
+    cold start where T_gen has not yet risen above the source temperature.
+    Final result clamped to [COP_CLAMP_MIN, COP_CLAMP_MAX].
+    """
+    if modulation <= 1.0 or heat_gen_temp <= COP_SOURCE_TEMP:
+        return 0.0
+
+    lift = heat_gen_temp - COP_SOURCE_TEMP
+
+    if heat_gen_temp <= COP_SH_MAX_TGEN:
+        # ── Space heating regime ──────────────────────────────────────────
+        if modulation < 12.0:
+            cop_base = 0.5833 * modulation
+        elif modulation <= 22.0:
+            cop_base = 7.0
+        else:
+            cop_base = 7.988 - (0.0449 * modulation)
+        cop = cop_base * (COP_SH_LIFT_REF / lift)
+    else:
+        # ── DHW regime ────────────────────────────────────────────────────
+        if modulation <= 33.0:
+            cop_base = 4.626 - (0.0417 * modulation)
+        elif modulation <= 60.0:
+            cop_base = 3.679 - (0.0130 * modulation)
+        else:
+            cop_base = 3.500 - (0.0100 * modulation)
+        cop = cop_base * (COP_DHW_LIFT_REF / lift)
+
+    return max(COP_CLAMP_MIN, min(COP_CLAMP_MAX, round(cop, 4)))
+
 
 # ── Dispatcher signal builders ─────────────────────────────────────────────
 def dp_signal(entry_id: str, dp_id: int) -> str:
@@ -78,6 +147,7 @@ def heater_signal(entry_id: str) -> str:
 
 def connection_signal(entry_id: str) -> str:
     return f"{DOMAIN}_{entry_id}_connection"
+
 
 # ── Sensor descriptions ───────────────────────────────────────────────────
 @dataclass(frozen=True)
@@ -205,10 +275,8 @@ SENSOR_DESCRIPTIONS: tuple[HovalSensorDescription, ...] = (
         "Heating Circuit Name",            "STR", 0, "",   None, None, "mdi:label"),
 )
 
-# Fast lookup: dp_id → description
 SENSOR_BY_DPID: dict[int, HovalSensorDescription] = {
     s.dp_id: s for s in SENSOR_DESCRIPTIONS
 }
 
-# dpIds whose sensor uses RestoreEntity (hardware counters)
 PERSISTENT_DPIDS: frozenset[int] = frozenset({23009})
