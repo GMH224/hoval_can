@@ -257,10 +257,23 @@ class HovalElectricHeaterEnergySensor(HovalBaseEntity, RestoreEntity):
                 self.hass, heater_signal(self._entry.entry_id), self._on_heater,
             )
         )
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, connection_signal(self._entry.entry_id),
+                self._on_conn,
+            )
+        )
         self._unsub = async_track_time_interval(
             self.hass, self._tick, _ENERGY_INTERVAL
         )
         self.async_on_remove(self._cleanup)
+
+    @callback
+    def _on_conn(self) -> None:
+        # Drop the open "heater on" interval on disconnect; otherwise a later
+        # off-transition/cleanup would flush the entire downtime as energy.
+        if not self._coord.connected:
+            self._on_since = None
 
     def _cleanup(self) -> None:
         if self._unsub:
@@ -392,12 +405,21 @@ class HovalHeatPumpElecEnergySensor(HovalBaseEntity, RestoreEntity):
                 self._update,
             )
         )
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, connection_signal(self._entry.entry_id),
+                self._on_conn,
+            )
+        )
 
     @callback
-    def _update(self) -> None:
-        now     = datetime.now(timezone.utc)
-        thermal = self._coord.get_value(DP_THERMAL_POWER)
-        cop     = self._coord.cop
+    def _on_conn(self) -> None:
+        # On disconnect, discard the open interval so the next sample after a
+        # reconnect does not integrate the entire downtime as one lump.
+        if not self._coord.connected:
+            self._last_thermal = None
+            self._last_cop     = 0.0
+            self._last_ts      = None
 
         # Integrate PREVIOUS interval using start-of-interval values
         if (self._last_thermal is not None and self._last_ts is not None
@@ -505,10 +527,24 @@ class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
             self.async_on_remove(
                 async_dispatcher_connect(self.hass, sig, self._update)
             )
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, connection_signal(self._entry.entry_id),
+                self._on_conn,
+            )
+        )
         self._unsub = async_track_time_interval(
             self.hass, self._tick, _ENERGY_INTERVAL
         )
         self.async_on_remove(self._cleanup)
+
+    @callback
+    def _on_conn(self) -> None:
+        # Discard the open interval on disconnect so a reconnect cannot
+        # integrate the downtime as a single fictitious lump.
+        if not self._coord.connected:
+            self._last_elec_kw = None
+            self._last_ts      = None
 
     def _cleanup(self) -> None:
         if self._unsub:

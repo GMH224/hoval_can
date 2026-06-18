@@ -9,7 +9,18 @@ from homeassistant.const import EntityCategory
 DOMAIN = "hoval_can"
 DEFAULT_PORT      = 3113
 RECONNECT_DELAY   = 10    # s between reconnect attempts
-FRAME_TIMEOUT     = 30    # s of silence before treating stream as stale
+FRAME_TIMEOUT     = 15    # s per read() poll — how often the watchdog wakes up
+STALE_TIMEOUT     = 90    # s without ANY received bytes → force reconnect
+                          # (frames normally arrive ~2 s apart; 90 s is well
+                          #  beyond any legitimate quiet period)
+
+# ── TCP keep-alive (defense in depth: lets the OS surface a dead peer) ──────
+# asyncio.open_connection() does NOT enable SO_KEEPALIVE by default, so a
+# half-open connection (gateway reboot / Wi-Fi drop with no FIN/RST) would
+# otherwise rely on the kernel default of ~2 h. These tune it aggressively.
+TCP_KEEPALIVE_IDLE     = 30   # s idle before first keepalive probe
+TCP_KEEPALIVE_INTERVAL = 10   # s between probes
+TCP_KEEPALIVE_COUNT    = 3    # failed probes before the socket is declared dead
 
 # ── Configurable options ───────────────────────────────────────────────────
 # COP is calculated dynamically from live sensor data — not user-configurable.

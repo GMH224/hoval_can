@@ -209,6 +209,17 @@ The Heizstab has no direct CAN-BUS datapoint. Detected as ON when:
 
 ## Changelog
 
+### v0.2.2
+- **Fix: integration silently stopped recording data until manual reload.** The
+  TCP read loop treated a half-open connection (gateway reboot / Wi-Fi drop with
+  no FIN/RST) as normal silence and looped forever, leaving every sensor frozen
+  while still reporting "available". Added an application-level inactivity
+  watchdog (force reconnect after `STALE_TIMEOUT` = 90 s without data) and
+  enabled tuned TCP keep-alive on the socket.
+- **Fix: false energy spike after a reconnect.** Energy integrators now discard
+  the open interval on disconnect, so the first sample after recovery no longer
+  integrates the entire downtime as one lump of kWh.
+
 ### v0.2.1
 - **Dynamic COP** replaces fixed configurable COP. Calculated from `compressor_modulation` and `heat_generator_temperature` using a two-regime piecewise model with live temperature-lift correction
 - New sensor: `sensor.hoval_can_heat_pump_cop`

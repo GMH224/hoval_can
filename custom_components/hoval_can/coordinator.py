@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import struct
+import time
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -13,9 +15,10 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from .const import (
     CMD_READ_RESP_BE, CMD_READ_RESP_LE,
     CONF_HEATER_POWER, DEFAULT_HEATER_POWER_KW, DEFAULT_PORT,
-    DOMAIN, FRAME_END, FRAME_SEP, FRAME_TIMEOUT,
+    DOMAIN, FRAME_END, FRAME_SEP, FRAME_TIMEOUT, STALE_TIMEOUT,
     HEATER_DETECTION_MARGIN, NULL_SENTINELS, RECONNECT_DELAY,
     SCHEDULE_GROUPS, SENSOR_BY_DPID, STRUCT_FMT, TBYTES,
+    TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_COUNT,
     DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_STATUS_WW,
     DP_HEAT_GEN, DP_MODULATION, DHW_STATUS_CHARGING,
     calculate_cop,
@@ -139,9 +142,11 @@ class HovalCANCoordinator:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(self._host, self._port), timeout=10
         )
+        _enable_keepalive(writer)
         self._set_connected(True)
         _LOGGER.info("Hoval CAN: connected.")
         buf = b""
+        last_rx = time.monotonic()   # watchdog: time of last received bytes
         try:
             while not self._stop:
                 try:
@@ -149,9 +154,20 @@ class HovalCANCoordinator:
                         reader.read(4096), timeout=float(FRAME_TIMEOUT)
                     )
                 except asyncio.TimeoutError:
+                    # A read timeout is NOT normal for this stream — frames
+                    # arrive ~2 s apart. If we have heard nothing at all for
+                    # STALE_TIMEOUT the socket is almost certainly half-open
+                    # (gateway reboot / Wi-Fi drop with no FIN/RST). Force a
+                    # reconnect instead of looping forever and silently
+                    # freezing every sensor.
+                    if time.monotonic() - last_rx >= STALE_TIMEOUT:
+                        raise ConnectionError(
+                            f"No data for {STALE_TIMEOUT}s — stream is stale"
+                        )
                     continue
                 if not chunk:
                     raise ConnectionError("Device closed connection")
+                last_rx = time.monotonic()
                 buf += chunk
                 parts = buf.split(FRAME_SEP)
                 buf = parts[-1]
@@ -232,6 +248,33 @@ class HovalCANCoordinator:
 
 
 # ── Numeric decoder (module-level for clarity) ────────────────────────────
+
+def _enable_keepalive(writer: asyncio.StreamWriter) -> None:
+    """Enable (and, on Linux, tune) TCP keep-alive on the open socket.
+
+    Defense in depth alongside the application-level watchdog: lets the OS
+    detect a vanished peer instead of relying on the ~2 h kernel default.
+    Silently degrades on platforms that lack the per-socket tuning options.
+    """
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    for opt_name, value in (
+        ("TCP_KEEPIDLE", TCP_KEEPALIVE_IDLE),
+        ("TCP_KEEPINTVL", TCP_KEEPALIVE_INTERVAL),
+        ("TCP_KEEPCNT", TCP_KEEPALIVE_COUNT),
+    ):
+        opt = getattr(socket, opt_name, None)
+        if opt is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+            except OSError:
+                pass
+
 
 def _decode_numeric(
     raw: bytes, typename: str, decimal: int, little_endian: bool = False
