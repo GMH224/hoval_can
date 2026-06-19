@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import datetime, timedelta
 
 from homeassistant.components.sensor import (
     SensorDeviceClass, SensorEntity, SensorStateClass,
@@ -236,7 +237,7 @@ class HovalElectricHeaterEnergySensor(HovalBaseEntity, RestoreEntity):
         self._attr_unique_id    = f"{entry.entry_id}_electric_heater_energy"
         self._attr_name         = "Electric Heater Energy"
         self._total_kwh         = 0.0
-        self._on_since: datetime | None = None
+        self._on_since: float | None = None
         self._unsub             = None
         self._attr_native_value = 0.0
 
@@ -279,14 +280,14 @@ class HovalElectricHeaterEnergySensor(HovalBaseEntity, RestoreEntity):
         if self._unsub:
             self._unsub(); self._unsub = None
         if self._on_since is not None:
-            self._flush(datetime.now(timezone.utc))
+            self._flush(time.monotonic())
 
     @callback
     def _on_heater(self) -> None:
         is_on = self._coord.electric_heater_on
         if is_on is None:
             return
-        now = datetime.now(timezone.utc)
+        now = time.monotonic()
         if is_on and self._on_since is None:
             self._on_since = now
         elif not is_on and self._on_since is not None:
@@ -296,20 +297,22 @@ class HovalElectricHeaterEnergySensor(HovalBaseEntity, RestoreEntity):
 
     @callback
     def _tick(self, now: datetime) -> None:
+        # `now` (wall clock) from the HA timer is ignored; elapsed time is
+        # measured with a monotonic clock for integrity across clock steps.
         if self._on_since is not None:
-            self._attr_native_value = self._live(now)
+            self._attr_native_value = self._live(time.monotonic())
             self.async_write_ha_state()
 
-    def _flush(self, now: datetime) -> None:
+    def _flush(self, now: float) -> None:
         if self._on_since is not None:
-            h = max(0.0, (now - self._on_since).total_seconds() / 3600.0)
+            h = max(0.0, (now - self._on_since) / 3600.0)
             self._total_kwh += h * self._coord.heater_power_kw
             self._on_since = None
 
-    def _live(self, now: datetime) -> float:
+    def _live(self, now: float) -> float:
         extra = 0.0
         if self._on_since is not None:
-            extra = (max(0.0, (now - self._on_since).total_seconds() / 3600.0)
+            extra = (max(0.0, (now - self._on_since) / 3600.0)
                      * self._coord.heater_power_kw)
         return round(self._total_kwh + extra, 3)
 
@@ -383,7 +386,7 @@ class HovalHeatPumpElecEnergySensor(HovalBaseEntity, RestoreEntity):
         self._total_kwh         = 0.0
         self._last_thermal      = None
         self._last_cop          = 0.0
-        self._last_ts: datetime | None = None
+        self._last_ts: float | None = None
         self._attr_native_value = 0.0
 
     async def async_added_to_hass(self) -> None:
@@ -421,11 +424,19 @@ class HovalHeatPumpElecEnergySensor(HovalBaseEntity, RestoreEntity):
             self._last_cop     = 0.0
             self._last_ts      = None
 
-        # Integrate PREVIOUS interval using start-of-interval values
+    @callback
+    def _update(self) -> None:
+        now     = time.monotonic()
+        thermal = self._coord.get_value(DP_THERMAL_POWER)
+        cop     = self._coord.cop
+
+        # Integrate PREVIOUS interval using start-of-interval values.
+        # Monotonic clock: immune to NTP/DST wall-clock steps that would
+        # otherwise lose energy (backward step) or over-count (forward step).
         if (self._last_thermal is not None and self._last_ts is not None
                 and thermal is not None
                 and self._last_cop > 0.0 and self._last_thermal > 0.0):
-            h = max(0.0, (now - self._last_ts).total_seconds() / 3600.0)
+            h = max(0.0, (now - self._last_ts) / 3600.0)
             self._total_kwh += h * (self._last_thermal / self._last_cop)
 
         if thermal is not None:
@@ -504,7 +515,7 @@ class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
         self._attr_name         = "Total Electrical Energy"
         self._total_kwh         = 0.0
         self._last_elec_kw      = None
-        self._last_ts: datetime | None = None
+        self._last_ts: float | None = None
         self._unsub             = None
         self._attr_native_value = 0.0
 
@@ -550,11 +561,11 @@ class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
         if self._unsub:
             self._unsub(); self._unsub = None
         if self._last_elec_kw is not None and self._last_ts is not None:
-            self._integrate(datetime.now(timezone.utc), None)
+            self._integrate(time.monotonic(), None)
 
     @callback
     def _update(self) -> None:
-        now       = datetime.now(timezone.utc)
+        now       = time.monotonic()
         thermal   = self._coord.get_value(DP_THERMAL_POWER)
         heater_on = self._coord.electric_heater_on
         if thermal is None or heater_on is None:
@@ -570,18 +581,19 @@ class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
 
     @callback
     def _tick(self, now: datetime) -> None:
+        # Wall-clock `now` ignored; monotonic clock used for elapsed time.
         if self._last_elec_kw is None or self._last_ts is None:
             return
-        h = max(0.0, (now - self._last_ts).total_seconds() / 3600.0)
+        h = max(0.0, (time.monotonic() - self._last_ts) / 3600.0)
         displayed = round(self._total_kwh + h * self._last_elec_kw, 3)
         if displayed != self._attr_native_value:
             self._attr_native_value = displayed
             self.async_write_ha_state()
 
-    def _integrate(self, now: datetime, new_kw) -> None:
+    def _integrate(self, now: float, new_kw) -> None:
         if (self._last_elec_kw is not None
                 and self._last_ts is not None and new_kw is not None):
-            h = max(0.0, (now - self._last_ts).total_seconds() / 3600.0)
+            h = max(0.0, (now - self._last_ts) / 3600.0)
             self._total_kwh += h * self._last_elec_kw
         if new_kw is not None:
             self._last_elec_kw = new_kw

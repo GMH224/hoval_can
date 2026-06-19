@@ -209,16 +209,53 @@ The Heizstab has no direct CAN-BUS datapoint. Detected as ON when:
 
 ## Changelog
 
-### v0.2.2
+### v0.2.3 — Frame-integrity pass
+- **Fix: a value byte-pair equal to the frame markers could mis-frame data.**
+  The receiver previously split the stream only on the start marker (`FF 01`),
+  so a datapoint value containing `FF 01` (or, after the v0.2.2 cleanup, ending
+  in `FF 02`) could corrupt that frame and occasionally the next one. The
+  receiver is now a **length-aware parser**: for every monitored fixed-width
+  datapoint the value length comes from the type table and the `FF 02`
+  end-marker position is verified, so in-value `FF 01`/`FF 02` can no longer
+  corrupt a monitored sensor. Variable-length (STR) and unmapped frames fall
+  back to end-marker scanning; a frame whose end-marker is misplaced is counted
+  as a desync and the parser resyncs to the next start marker — a monitored
+  sensor is never updated from a mis-delimited frame (at worst a sample is
+  dropped).
+- **Observability:** the diagnostic connectivity sensor now also exposes
+  `framing_errors` (cumulative desync count) so frame health is alarmable.
+- **Tests:** added `tests/test_protocol.py` — a standalone suite (no Home
+  Assistant install required) covering the COP model, numeric decoder,
+  adversarial framing (in-value markers, split reads, desync recovery, LE/STR),
+  the connection watchdog, and integrator arithmetic.
+
+### v0.2.2 — Reliability / industrial-hardening pass
 - **Fix: integration silently stopped recording data until manual reload.** The
   TCP read loop treated a half-open connection (gateway reboot / Wi-Fi drop with
   no FIN/RST) as normal silence and looped forever, leaving every sensor frozen
-  while still reporting "available". Added an application-level inactivity
-  watchdog (force reconnect after `STALE_TIMEOUT` = 90 s without data) and
-  enabled tuned TCP keep-alive on the socket.
+  while still reporting "available". Added a **byte-level inactivity watchdog**
+  (reconnect after 90 s with no bytes) plus a **data-level watchdog** (reconnect
+  after 300 s with no *decodable* datapoint, catching a live-but-desynced
+  stream), and enabled tuned **TCP keep-alive** on the socket.
 - **Fix: false energy spike after a reconnect.** Energy integrators now discard
   the open interval on disconnect, so the first sample after recovery no longer
   integrates the entire downtime as one lump of kWh.
+- **Fix: energy totals corrupted by wall-clock steps.** All energy integration
+  now uses a **monotonic clock** instead of `datetime.now()`; NTP/DST steps can
+  no longer lose energy (backward step) or over-count (forward step).
+- **Hardening: bounded RX buffer.** The receive buffer is now capped (64 KiB)
+  and resynced on overflow, removing an unbounded-growth / memory-exhaustion
+  path when the frame separator never appears.
+- **Hardening: reconnect storm control.** Reconnects use capped exponential
+  backoff with jitter (10 → 120 s), and repeated failure logs are de-duplicated
+  (first at WARNING, repeats at DEBUG, recovery announced) to prevent log flood.
+- **Lifecycle: tracked background task.** The reader task is now owned by the
+  config entry, so it is reliably cancelled on unload/shutdown (no orphaned
+  task warnings).
+- **Observability: new `binary_sensor.hoval_can_gateway_connection`**
+  (diagnostic, device-class connectivity). Reports OFF on disconnect and exposes
+  `last_data_age_seconds`, `reconnect_count`, and `last_error` — suitable as an
+  ICS staleness/health alarm source.
 
 ### v0.2.1
 - **Dynamic COP** replaces fixed configurable COP. Calculated from `compressor_modulation` and `heat_generator_temperature` using a two-regime piecewise model with live temperature-lift correction

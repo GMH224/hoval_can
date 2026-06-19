@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import socket
 import struct
 import time
@@ -15,8 +16,10 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from .const import (
     CMD_READ_RESP_BE, CMD_READ_RESP_LE,
     CONF_HEATER_POWER, DEFAULT_HEATER_POWER_KW, DEFAULT_PORT,
-    DOMAIN, FRAME_END, FRAME_SEP, FRAME_TIMEOUT, STALE_TIMEOUT,
-    HEATER_DETECTION_MARGIN, NULL_SENTINELS, RECONNECT_DELAY,
+    FRAME_END, FRAME_SEP, FRAME_TIMEOUT, STALE_TIMEOUT,
+    DATA_STALE_TIMEOUT, MAX_RX_BUFFER, RX_RESYNC_KEEP,
+    HEATER_DETECTION_MARGIN, NULL_SENTINELS,
+    RECONNECT_DELAY, RECONNECT_DELAY_MAX, RECONNECT_BACKOFF,
     SCHEDULE_GROUPS, SENSOR_BY_DPID, STRUCT_FMT, TBYTES,
     TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_COUNT,
     DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_STATUS_WW,
@@ -45,6 +48,11 @@ class HovalCANCoordinator:
         self._task: asyncio.Task | None = None
         self._stop       = False
         self._heater_on: bool | None = None
+        # ── Observability / diagnostics (read by the connectivity sensor) ──
+        self._last_data_mono: float = 0.0   # monotonic ts of last decoded dp
+        self._reconnect_count: int  = 0     # successful (re)connects after 1st
+        self._last_error: str | None = None # last connection failure reason
+        self._framing_errors: int   = 0     # cumulative frame desync events
 
     # ── Public properties ─────────────────────────────────────────────────
 
@@ -74,6 +82,28 @@ class HovalCANCoordinator:
     @property
     def connected(self) -> bool:
         return self._connected
+
+    @property
+    def last_data_age(self) -> float | None:
+        """Seconds since the last decoded datapoint, or None if never."""
+        if self._last_data_mono == 0.0:
+            return None
+        return max(0.0, time.monotonic() - self._last_data_mono)
+
+    @property
+    def reconnect_count(self) -> int:
+        """Number of successful reconnects since the integration loaded."""
+        return self._reconnect_count
+
+    @property
+    def last_error(self) -> str | None:
+        """Human-readable reason for the most recent connection failure."""
+        return self._last_error
+
+    @property
+    def framing_errors(self) -> int:
+        """Cumulative count of frame desync events (resyncs)."""
+        return self._framing_errors
 
     @property
     def electric_heater_on(self) -> bool | None:
@@ -106,10 +136,19 @@ class HovalCANCoordinator:
 
     async def async_start(self) -> None:
         self._stop = False
-        self._task = self.hass.loop.create_task(
-            self._connection_loop(),
-            name=f"hoval_can_{self._entry.entry_id}",
-        )
+        # Use the config-entry's tracked background-task helper where available
+        # (HA 2023.4+) so the task is owned by the entry and is reliably
+        # cancelled on unload / HA shutdown. Fall back to a raw loop task on
+        # older cores. A bare loop.create_task() would otherwise leak and emit
+        # "Task was destroyed but it is pending" on shutdown.
+        coro = self._connection_loop()
+        name = f"hoval_can_{self._entry.entry_id}"
+        if hasattr(self._entry, "async_create_background_task"):
+            self._task = self._entry.async_create_background_task(
+                self.hass, coro, name
+            )
+        else:  # pragma: no cover - legacy cores
+            self._task = self.hass.loop.create_task(coro, name=name)
 
     async def async_stop(self) -> None:
         self._stop = True
@@ -119,23 +158,45 @@ class HovalCANCoordinator:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            self._task = None
 
     # ── Connection loop ───────────────────────────────────────────────────
 
     async def _connection_loop(self) -> None:
+        delay = RECONNECT_DELAY
         while not self._stop:
             try:
                 await self._connect_and_read()
+                # Clean return (only on stop) — no backoff needed.
+                delay = RECONNECT_DELAY
             except asyncio.CancelledError:
                 return
             except Exception as exc:  # noqa: BLE001
-                if not self._stop:
+                if self._stop:
+                    return
+                self._set_connected(False)
+                reason = f"{type(exc).__name__}: {exc}"
+                # Log the first failure of an outage at WARNING; demote the
+                # repeats to DEBUG so a long outage cannot flood the log, then
+                # announce recovery once we reconnect.
+                if reason != self._last_error:
                     _LOGGER.warning(
-                        "Hoval CAN: connection to %s failed: %s — retry in %ds",
-                        self._host, exc, RECONNECT_DELAY,
+                        "Hoval CAN: connection to %s lost (%s) — retrying "
+                        "(backoff up to %ds)", self._host, reason,
+                        RECONNECT_DELAY_MAX,
                     )
-                    self._set_connected(False)
-                    await asyncio.sleep(RECONNECT_DELAY)
+                else:
+                    _LOGGER.debug(
+                        "Hoval CAN: still down (%s) — retry in %.0fs",
+                        reason, delay,
+                    )
+                self._last_error = reason
+                # Exponential backoff with full jitter, capped.
+                sleep_for = min(delay, RECONNECT_DELAY_MAX)
+                sleep_for = random.uniform(RECONNECT_DELAY, sleep_for) \
+                    if sleep_for > RECONNECT_DELAY else RECONNECT_DELAY
+                await asyncio.sleep(sleep_for)
+                delay = min(delay * RECONNECT_BACKOFF, RECONNECT_DELAY_MAX)
 
     async def _connect_and_read(self) -> None:
         _LOGGER.info("Hoval CAN: connecting to %s:%d …", self._host, self._port)
@@ -143,36 +204,60 @@ class HovalCANCoordinator:
             asyncio.open_connection(self._host, self._port), timeout=10
         )
         _enable_keepalive(writer)
+        was_down = self._last_error is not None
+        self._last_error = None
+        self._last_data_mono = time.monotonic()  # grace period from connect
+        if was_down:
+            self._reconnect_count += 1
+            _LOGGER.info(
+                "Hoval CAN: reconnected to %s (reconnect #%d).",
+                self._host, self._reconnect_count,
+            )
+        else:
+            _LOGGER.info("Hoval CAN: connected.")
         self._set_connected(True)
-        _LOGGER.info("Hoval CAN: connected.")
         buf = b""
-        last_rx = time.monotonic()   # watchdog: time of last received bytes
+        last_rx = time.monotonic()   # byte-level watchdog
         try:
             while not self._stop:
+                now = time.monotonic()
+                # Data-level watchdog: socket alive and maybe even streaming
+                # bytes, but no decodable datapoint for DATA_STALE_TIMEOUT
+                # (corruption / protocol desync). Bytes alone would fool the
+                # byte-level watchdog below, so this guard runs every loop.
+                if now - self._last_data_mono >= DATA_STALE_TIMEOUT:
+                    raise ConnectionError(
+                        f"No decodable data for {DATA_STALE_TIMEOUT}s "
+                        "— stream desynced"
+                    )
                 try:
                     chunk = await asyncio.wait_for(
                         reader.read(4096), timeout=float(FRAME_TIMEOUT)
                     )
                 except asyncio.TimeoutError:
-                    # A read timeout is NOT normal for this stream — frames
-                    # arrive ~2 s apart. If we have heard nothing at all for
-                    # STALE_TIMEOUT the socket is almost certainly half-open
-                    # (gateway reboot / Wi-Fi drop with no FIN/RST). Force a
-                    # reconnect instead of looping forever and silently
-                    # freezing every sensor.
+                    # Byte-level watchdog: a read timeout is NOT normal here
+                    # (frames arrive ~2 s apart). Prolonged silence means a
+                    # half-open socket (gateway reboot / Wi-Fi drop with no
+                    # FIN/RST). Force a reconnect rather than spin forever and
+                    # silently freeze every sensor.
                     if time.monotonic() - last_rx >= STALE_TIMEOUT:
                         raise ConnectionError(
-                            f"No data for {STALE_TIMEOUT}s — stream is stale"
+                            f"No bytes for {STALE_TIMEOUT}s — socket half-open"
                         )
                     continue
                 if not chunk:
                     raise ConnectionError("Device closed connection")
                 last_rx = time.monotonic()
                 buf += chunk
-                parts = buf.split(FRAME_SEP)
-                buf = parts[-1]
-                for part in parts[:-1]:
-                    self._handle_frame(part)
+                buf = self._consume_frames(buf)
+                # RX buffer hard cap: if no frame can be extracted the tail
+                # must not grow without bound (memory-exhaustion guard).
+                if len(buf) > MAX_RX_BUFFER:
+                    _LOGGER.warning(
+                        "Hoval CAN: RX buffer exceeded %d bytes without a valid "
+                        "frame — discarding to resync.", MAX_RX_BUFFER,
+                    )
+                    buf = buf[-RX_RESYNC_KEEP:]
         finally:
             writer.close()
             try:
@@ -183,8 +268,83 @@ class HovalCANCoordinator:
 
     # ── Frame handling ────────────────────────────────────────────────────
 
+    # Fixed header geometry of a frame body (the bytes between FRAME_SEP and
+    # FRAME_END):  [3B hdr][2B unit][1B cmd][2B group][2B dp_id][value]
+    _HDR_LEN = 10   # bytes before the value field
+
+    def _value_field_len(self, cmd: int, dp_id: int) -> int | None:
+        """Byte length of the value field for a frame, or None if unknown.
+
+        Known fixed-width frames can be parsed by length, which lets us verify
+        the FF 02 end-marker lands exactly where expected — so a value byte
+        equal to FF 01 / FF 02 can never mis-frame a monitored datapoint.
+        Returns None for variable-length (STR) or unmapped datapoints, which
+        fall back to end-marker scanning.
+        """
+        if cmd == CMD_READ_RESP_LE:
+            return 3            # 1 skipped byte (0x00) + 2 data bytes
+        if cmd == CMD_READ_RESP_BE:
+            desc = SENSOR_BY_DPID.get(dp_id)
+            if desc is None or desc.typename == "STR":
+                return None
+            return TBYTES.get(desc.typename)
+        return None
+
+    def _consume_frames(self, buf: bytes) -> bytes:
+        """Extract and dispatch every complete frame in ``buf``.
+
+        Returns the unconsumed remainder (to be prepended to the next read).
+        Length-aware for known fixed-width datapoints (FF 02 position is
+        validated); end-marker scanning for variable/unknown frames. A frame
+        whose end-marker is not where the length predicts is treated as a
+        desync: we count it and resync to the next start marker. This is the
+        ICS-critical property — a monitored sensor is never updated from a
+        mis-delimited frame; at worst a sample is dropped.
+        """
+        i = 0
+        n = len(buf)
+        seplen = len(FRAME_SEP)
+        endlen = len(FRAME_END)
+        while True:
+            start = buf.find(FRAME_SEP, i)
+            if start < 0:
+                # No start marker left. Keep a short tail in case a marker is
+                # split across reads.
+                return buf[max(i, n - (seplen - 1)):]
+            content = start + seplen
+            if n - content < self._HDR_LEN:
+                return buf[start:]          # header incomplete — wait for more
+
+            cmd   = buf[content + 5]
+            dp_id = struct.unpack(">H", buf[content + 8:content + 10])[0]
+            vlen  = self._value_field_len(cmd, dp_id)
+
+            if vlen is not None:
+                end_pos = content + self._HDR_LEN + vlen
+                if n - end_pos < endlen:
+                    return buf[start:]      # value/end-marker incomplete — wait
+                if buf[end_pos:end_pos + endlen] == FRAME_END:
+                    self._handle_frame(buf[content:end_pos])
+                    i = end_pos + endlen
+                    continue
+                # End-marker absent where the length predicts → desync.
+                self._framing_errors += 1
+                i = content                 # resync: search past this marker
+                continue
+
+            # Unknown / variable-length: scan for the end marker.
+            end = buf.find(FRAME_END, content + self._HDR_LEN)
+            if end < 0:
+                return buf[start:]          # incomplete — wait for more
+            self._handle_frame(buf[content:end])
+            i = end + endlen
+
     def _handle_frame(self, data: bytes) -> None:
-        s = data[:-2] if data.endswith(FRAME_END) else data
+        # ``data`` is one frame body (header + value), already delimited and
+        # stripped of the FF 01 / FF 02 markers by _consume_frames. It must NOT
+        # be trimmed again here: a value field may legitimately end in 0xFF 0x02
+        # and trimming would corrupt it.
+        s = data
         if len(s) < 10:
             return
 
@@ -229,6 +389,7 @@ class HovalCANCoordinator:
 
     def _update_dp(self, dp_id: int, value: Any) -> None:
         self._data[dp_id] = value
+        self._last_data_mono = time.monotonic()   # feeds the data watchdog
         async_dispatcher_send(self.hass, dp_signal(self._entry.entry_id, dp_id))
 
         if dp_id in (DP_STATUS_WW, DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_HEAT_GEN):

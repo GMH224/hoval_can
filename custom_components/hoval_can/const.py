@@ -8,11 +8,25 @@ from homeassistant.const import EntityCategory
 
 DOMAIN = "hoval_can"
 DEFAULT_PORT      = 3113
-RECONNECT_DELAY   = 10    # s between reconnect attempts
+RECONNECT_DELAY   = 10    # s between reconnect attempts (initial / floor)
+RECONNECT_DELAY_MAX = 120 # s — cap for exponential reconnect backoff
+RECONNECT_BACKOFF = 2.0   # exponential growth factor between attempts
 FRAME_TIMEOUT     = 15    # s per read() poll — how often the watchdog wakes up
 STALE_TIMEOUT     = 90    # s without ANY received bytes → force reconnect
                           # (frames normally arrive ~2 s apart; 90 s is well
                           #  beyond any legitimate quiet period)
+DATA_STALE_TIMEOUT = 300  # s without a DECODABLE datapoint → force reconnect.
+                          # Catches a socket that is alive and streaming bytes
+                          # but no longer yielding usable frames (corruption /
+                          # protocol desync) — bytes alone would fool the
+                          # byte-level watchdog above.
+
+# ── RX framing safety ──────────────────────────────────────────────────────
+# Frames are tens of bytes and the separator recurs ~every 2 s, so the working
+# buffer stays small. If the separator never appears (garbage / desync) the
+# buffer must not grow without bound — that would be a memory-exhaustion DoS.
+MAX_RX_BUFFER  = 65536    # bytes — hard cap on the un-split RX buffer
+RX_RESYNC_KEEP = 1024     # bytes retained after an overflow to allow resync
 
 # ── TCP keep-alive (defense in depth: lets the OS surface a dead peer) ──────
 # asyncio.open_connection() does NOT enable SO_KEEPALIVE by default, so a

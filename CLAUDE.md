@@ -123,8 +123,19 @@ strings.json / translations/en.json   Options UI (heater power only)
 ---
 
 ## Known gaps / future work
-1. **0x70 PUSH-MULTI** — compact status blocks not decoded
+1. **0x70 PUSH-MULTI** — compact status blocks not decoded (skipped by the
+   length-aware parser via end-marker scanning; never corrupts monitored dpids)
 2. **LIST text labels** — DpIds 3050/9075 show integer codes
 3. **COP_SOURCE_TEMP** not yet in options flow (recalibrate in const.py)
 4. **Winter heater capture** — detection logic correct but not validated live
 5. **Write support** — 0x56 frames observed; format partially characterised
+6. **Frame value-field offset** — the parser assumes the value sits at byte 10
+   immediately before `FF 02` (per the documented layout). If the device ever
+   emits trailing bytes before `FF 02`, the `framing_errors` counter rises and
+   the data watchdog forces reconnects — i.e. the assumption is observable and
+   fail-safe, not silent. Re-confirm against a live capture if `framing_errors`
+   is non-trivial in the field.
+
+## Tests
+`python3 tests/test_protocol.py` — standalone (stubs HA), exit 0 == pass.
+Covers COP points, numeric decode, adversarial framing, watchdog, integrators.
