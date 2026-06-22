@@ -15,6 +15,8 @@ from homeassistant.core import callback
 
 from .const import (
     CONF_HEATER_POWER, DEFAULT_HEATER_POWER_KW,
+    CONF_COOLING_POWER, DEFAULT_COOLING_POWER_W,
+    COOLING_POWER_MAX, COOLING_POWER_MIN,
     DEFAULT_PORT, DOMAIN,
     HEATER_POWER_MAX, HEATER_POWER_MIN,
 )
@@ -75,7 +77,7 @@ class HovalCANConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class HovalCANOptionsFlow(OptionsFlow):
-    """Options: electric heater rated power.
+    """Options: electric heater rated power and passive-cooling pump power.
 
     COP is calculated automatically from live sensor data and does not
     appear here.
@@ -90,13 +92,23 @@ class HovalCANOptionsFlow(OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        current = float(
-            self._config_entry.options.get(CONF_HEATER_POWER, DEFAULT_HEATER_POWER_KW)
+        opts = self._config_entry.options
+        current_heater = float(
+            opts.get(CONF_HEATER_POWER, DEFAULT_HEATER_POWER_KW)
         )
+        current_cooling = float(
+            opts.get(CONF_COOLING_POWER, DEFAULT_COOLING_POWER_W)
+        )
+        # Both fields are present in the schema so that saving one does not
+        # drop the other (async_create_entry replaces the whole options dict).
         schema = vol.Schema({
-            vol.Required(CONF_HEATER_POWER, default=current): vol.All(
+            vol.Required(CONF_HEATER_POWER, default=current_heater): vol.All(
                 vol.Coerce(float),
                 vol.Range(min=HEATER_POWER_MIN, max=HEATER_POWER_MAX),
+            ),
+            vol.Required(CONF_COOLING_POWER, default=current_cooling): vol.All(
+                vol.Coerce(float),
+                vol.Range(min=COOLING_POWER_MIN, max=COOLING_POWER_MAX),
             ),
         })
         return self.async_show_form(step_id="init", data_schema=schema)

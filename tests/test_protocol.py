@@ -48,15 +48,41 @@ class _Platform(enum.Enum):
 _mod("homeassistant")
 _mod("homeassistant.core", HomeAssistant=type("HomeAssistant", (), {}),
      callback=lambda f: f)
-_mod("homeassistant.const", Platform=_Platform, EntityCategory=_EC)
+
+
+class _UnitOfEnergy:
+    KILO_WATT_HOUR = "kWh"
+
+
+_mod("homeassistant.const", Platform=_Platform, EntityCategory=_EC,
+     STATE_UNAVAILABLE="unavailable", STATE_UNKNOWN="unknown",
+     CONF_HOST="host", CONF_PORT="port", UnitOfEnergy=_UnitOfEnergy)
 _mod("homeassistant.config_entries", ConfigEntry=type("ConfigEntry", (), {}))
 _mod("homeassistant.components")
 _mod("homeassistant.components.sensor",
-     SensorDeviceClass=_SDC, SensorStateClass=_SC)
+     SensorDeviceClass=_SDC, SensorStateClass=_SC,
+     SensorEntity=type("SensorEntity", (), {}))
 _mod("homeassistant.helpers")
+
+# Recording dispatcher so tests can assert which signals were emitted.
+_SENT: list = []
+
+
+def _send(hass, signal, *a, **k):
+    _SENT.append(signal)
+
+
 _mod("homeassistant.helpers.dispatcher",
-     async_dispatcher_send=lambda *a, **k: None,
-     async_dispatcher_connect=lambda *a, **k: (lambda: None))
+     async_dispatcher_send=_send,
+     async_dispatcher_connect=lambda *a, **k: (lambda: None),
+     _SENT=_SENT)
+_mod("homeassistant.helpers.entity", DeviceInfo=dict)
+_mod("homeassistant.helpers.entity_platform",
+     AddEntitiesCallback=type("AddEntitiesCallback", (), {}))
+_mod("homeassistant.helpers.event",
+     async_track_time_interval=lambda *a, **k: (lambda: None))
+_mod("homeassistant.helpers.restore_state",
+     RestoreEntity=type("RestoreEntity", (), {}))
 
 # ── Import the component under test ─────────────────────────────────────────
 sys.path.insert(0, os.path.join(
@@ -256,12 +282,149 @@ def test_integrator_math():
     approx("1h @1kW -> 1.0 kWh", total, 1.0)
 
 
+def _co_with_options(options):
+    entry = types.SimpleNamespace(entry_id="e1",
+                                  data={"host": "h", "port": 3113},
+                                  options=options)
+    return C.HovalCANCoordinator(types.SimpleNamespace(loop=None), entry)
+
+
+def test_cooling_coordinator():
+    print("== passive cooling: coordinator ==")
+    HC = const.DP_STATUS_HC
+
+    # cooling_power_kw: Watts -> kW, default, bad values
+    co = _co_with_options({})
+    approx("default cooling power 0.1 kW", co.cooling_power_kw, 0.1)
+    co = _co_with_options({const.CONF_COOLING_POWER: 250})
+    approx("250 W -> 0.25 kW", co.cooling_power_kw, 0.25)
+    co = _co_with_options({const.CONF_COOLING_POWER: "bad"})
+    approx("garbage -> default 0.1 kW", co.cooling_power_kw, 0.1)
+    co = _co_with_options({const.CONF_COOLING_POWER: -50})
+    approx("negative -> 0 kW", co.cooling_power_kw, 0.0)
+
+    # passive_cooling_on: None until seen, True at 9, False otherwise
+    co = _co()
+    expect("unknown -> None", co.passive_cooling_on is None)
+    co._update_dp(HC, 9)
+    expect("status 9 -> True", co.passive_cooling_on is True)
+    co._update_dp(HC, 1)
+    expect("status 1 -> False", co.passive_cooling_on is False)
+
+    # edge-triggered cooling_signal dispatch (no repeats)
+    from homeassistant.helpers import dispatcher as D
+    sig = const.cooling_signal("e1")
+    co = _co()
+    D._SENT.clear()
+    co._update_dp(HC, 9)          # None -> True : edge
+    co._update_dp(HC, 9)          # True -> True : no edge
+    co._update_dp(HC, 0)          # True -> False: edge
+    n = D._SENT.count(sig)
+    expect("cooling_signal fired exactly twice (2 transitions)", n == 2)
+
+
+def test_cooling_sensors():
+    print("== passive cooling: sensors ==")
+    from hoval_can import sensor as S
+
+    class FakeCoord:
+        def __init__(self):
+            self.connected = True
+            self.heater_power_kw = 3.0
+            self.cooling_power_kw = 0.1
+            self._cop = 0.0
+            self.thermal = None
+            self.heater = None
+            self.cooling = None
+
+        def get_value(self, dp):
+            return self.thermal if dp == S.DP_THERMAL_POWER else None
+
+        @property
+        def cop(self):
+            return self._cop
+
+        @property
+        def electric_heater_on(self):
+            return self.heater
+
+        @property
+        def passive_cooling_on(self):
+            return self.cooling
+
+    def total_power(coord):
+        obj = object.__new__(S.HovalTotalElecPowerSensor)
+        obj._coord = coord
+        obj._attr_native_value = None
+        obj.async_write_ha_state = lambda: None
+        obj._update()
+        return obj._attr_native_value
+
+    fc = FakeCoord()
+    # No data yet -> Unknown (unchanged availability rule)
+    fc.thermal, fc.heater, fc.cooling = None, None, None
+    expect("totals Unknown when thermal/heater unknown", total_power(fc) is None)
+
+    # Cooling status still unknown but thermal+heater known -> NO regression,
+    # cooling treated as 0.
+    fc.thermal, fc.heater, fc.cooling, fc._cop = 0.0, False, None, 0.0
+    approx("cooling None -> 0 contribution", total_power(fc), 0.0)
+
+    # Passive cooling active: +0.1 kW
+    fc.cooling = True
+    approx("cooling on adds 0.1 kW", total_power(fc), 0.1)
+
+    # Cooling on + heater on + heat pump running
+    fc.thermal, fc._cop, fc.heater, fc.cooling = 6.0, 3.0, True, True
+    # hp = 6/3 = 2.0, heater 3.0, cooling 0.1 -> 5.1
+    approx("combined hp+heater+cooling", total_power(fc), 5.1)
+
+    # Cooling off -> term drops
+    fc.cooling = False
+    approx("cooling off -> no cooling term", total_power(fc), 5.0)
+
+    # Passive Cooling Power sensor
+    pc = object.__new__(S.HovalPassiveCoolingPowerSensor)
+    pc._coord = fc
+    pc._attr_native_value = None
+    pc._has_value = False
+    pc.async_write_ha_state = lambda: None
+    fc.cooling = None
+    pc._update()
+    expect("PC power stays Unknown while status unknown",
+           pc._attr_native_value is None)
+    fc.cooling = True
+    pc._update()
+    approx("PC power = 0.1 kW when cooling", pc._attr_native_value, 0.1)
+    fc.cooling = False
+    pc._update()
+    approx("PC power = 0 when not cooling", pc._attr_native_value, 0.0)
+
+    # Passive Cooling Energy: 1 h @ 0.1 kW -> +0.1 kWh
+    pe = object.__new__(S.HovalPassiveCoolingEnergySensor)
+    pe._coord = fc
+    pe._total_kwh = 0.0
+    pe._on_since = 1000.0
+    pe._flush(1000.0 + 3600.0)
+    approx("PC energy 1h@100W -> 0.1 kWh", pe._total_kwh, 0.1)
+
+    # Total Energy integrate path includes cooling term
+    te = object.__new__(S.HovalTotalElecEnergySensor)
+    te._total_kwh = 0.0
+    te._last_elec_kw = 0.1     # cooling-only draw
+    te._last_ts = 1000.0
+    te._integrate(1000.0 + 3600.0, 0.1)
+    approx("Total energy 1h@100W cooling -> 0.1 kWh", te._total_kwh, 0.1)
+
+
 def main():
     test_cop()
     test_decode()
     test_framing()
     test_watchdog()
     test_integrator_math()
+    test_cooling_coordinator()
+    test_cooling_sensors()
     print()
     print("RESULT:", "ALL PASS" if not _fails else f"{len(_fails)} FAIL: {_fails}")
     sys.exit(1 if _fails else 0)

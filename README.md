@@ -209,6 +209,24 @@ The Heizstab has no direct CAN-BUS datapoint. Detected as ON when:
 
 ## Changelog
 
+### v0.2.4 — Passive cooling energy tracking
+- **New: passive ("free") cooling power & energy.** When the Heating Circuit
+  Status (DpId 2051) reports passive cooling (value 9), the circulation-pump
+  draw is now tracked. Two new entities are added — **Passive Cooling Power**
+  (kW) and **Passive Cooling Energy** (kWh, cumulative) — and the term is also
+  folded into **Total Electrical Power** and **Total Electrical Energy**.
+- **New option: Passive Cooling Power (W)** — configurable in the integration
+  options, range 0–500 W, default 100 W (set to your circulation-pump draw).
+  Stored in watts; converted to kW internally.
+- The cooling term is purely additive: passive cooling runs with the compressor
+  off, so it does not overlap the COP-based heat-pump term (which is 0 when the
+  compressor is idle). Installations without a cooling circuit are unaffected —
+  unknown cooling status is treated as 0 W, so the electrical totals never
+  regress.
+- Tests extended (`tests/test_protocol.py`) covering the new config property,
+  status detection, edge-triggered dispatch, the combined-power formula, the
+  no-regression rule, and the energy integration.
+
 ### v0.2.3 — Frame-integrity pass
 - **Fix: a value byte-pair equal to the frame markers could mis-frame data.**
   The receiver previously split the stream only on the start marker (`FF 01`),

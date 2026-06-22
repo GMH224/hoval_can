@@ -16,6 +16,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from .const import (
     CMD_READ_RESP_BE, CMD_READ_RESP_LE,
     CONF_HEATER_POWER, DEFAULT_HEATER_POWER_KW, DEFAULT_PORT,
+    CONF_COOLING_POWER, DEFAULT_COOLING_POWER_W,
     FRAME_END, FRAME_SEP, FRAME_TIMEOUT, STALE_TIMEOUT,
     DATA_STALE_TIMEOUT, MAX_RX_BUFFER, RX_RESYNC_KEEP,
     HEATER_DETECTION_MARGIN, NULL_SENTINELS,
@@ -23,9 +24,10 @@ from .const import (
     SCHEDULE_GROUPS, SENSOR_BY_DPID, STRUCT_FMT, TBYTES,
     TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_COUNT,
     DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_STATUS_WW,
+    DP_STATUS_HC, HC_STATUS_PASSIVE_COOLING,
     DP_HEAT_GEN, DP_MODULATION, DHW_STATUS_CHARGING,
     calculate_cop,
-    connection_signal, dp_signal, heater_signal,
+    connection_signal, cooling_signal, dp_signal, heater_signal,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,6 +50,7 @@ class HovalCANCoordinator:
         self._task: asyncio.Task | None = None
         self._stop       = False
         self._heater_on: bool | None = None
+        self._cooling_on: bool | None = None
         # ── Observability / diagnostics (read by the connectivity sensor) ──
         self._last_data_mono: float = 0.0   # monotonic ts of last decoded dp
         self._reconnect_count: int  = 0     # successful (re)connects after 1st
@@ -78,6 +81,22 @@ class HovalCANCoordinator:
             )
         except (TypeError, ValueError):
             return DEFAULT_HEATER_POWER_KW
+
+    @property
+    def cooling_power_kw(self) -> float:
+        """Passive-cooling circulation power in kW.
+
+        Configured in WATTS (CONF_COOLING_POWER); converted to kW here so it
+        composes with the kW-based power/energy maths. Negative/garbage values
+        are coerced to a safe default.
+        """
+        try:
+            watts = float(
+                self._entry.options.get(CONF_COOLING_POWER, DEFAULT_COOLING_POWER_W)
+            )
+        except (TypeError, ValueError):
+            watts = DEFAULT_COOLING_POWER_W
+        return max(0.0, watts) / 1000.0
 
     @property
     def connected(self) -> bool:
@@ -128,6 +147,25 @@ class HovalCANCoordinator:
             and dhw_actual < dhw_sp
             and heat_gen <= dhw_actual + HEATER_DETECTION_MARGIN
         )
+
+    @property
+    def passive_cooling_on(self) -> bool | None:
+        """True when the heating circuit is in passive ("free") cooling mode.
+
+        Direct read of Heating Circuit Status (DpId 2051 == 9). Returns None
+        until that datapoint has been seen, so consumers can treat 'unknown'
+        as 'not cooling' — installations without a cooling circuit therefore
+        never regress the electrical totals.
+
+        Passive cooling runs with the compressor OFF (only circulation pumps),
+        so this power is additive to — and does not overlap with — the
+        COP-based heat-pump electrical term (which is 0 when the compressor is
+        idle).
+        """
+        status = self._data.get(DP_STATUS_HC)
+        if status is None:
+            return None
+        return status == HC_STATUS_PASSIVE_COOLING
 
     def get_value(self, dp_id: int) -> Any:
         return self._data.get(dp_id)
@@ -398,6 +436,14 @@ class HovalCANCoordinator:
                 self._heater_on = new_state
                 async_dispatcher_send(
                     self.hass, heater_signal(self._entry.entry_id)
+                )
+
+        if dp_id == DP_STATUS_HC:
+            new_cooling = self.passive_cooling_on
+            if new_cooling != self._cooling_on:
+                self._cooling_on = new_cooling
+                async_dispatcher_send(
+                    self.hass, cooling_signal(self._entry.entry_id)
                 )
 
     def _set_connected(self, state: bool) -> None:

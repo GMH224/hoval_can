@@ -43,6 +43,14 @@ DEFAULT_HEATER_POWER_KW: float = 3.0   # Rated power of the electric DHW heater
 HEATER_POWER_MIN      = 0.5            # kW
 HEATER_POWER_MAX      = 12.0           # kW  (dual-element upper bound)
 
+# Passive ("free"/natural) cooling: the compressor is OFF and only the
+# circulation pump(s) run, so the draw is small and roughly constant. Configured
+# in WATTS (not kW) to match the small magnitudes involved.
+CONF_COOLING_POWER       = "cooling_power_w"
+DEFAULT_COOLING_POWER_W: float = 100.0  # W — typical circulation-pump draw
+COOLING_POWER_MIN        = 0.0          # W
+COOLING_POWER_MAX        = 500.0        # W
+
 # ── CAN-BUS protocol ──────────────────────────────────────────────────────
 FRAME_SEP = b"\xff\x01"
 FRAME_END = b"\xff\x02"
@@ -83,11 +91,13 @@ HEATER_DETECTION_MARGIN: float = 5.0   # °C
 DP_DHW_ACTUAL      = 4       # Warmwasser-Ist        S16 dec=1 °C
 DP_DHW_SETPOINT    = 1004    # Warmwasser-Soll       S16 dec=1 °C
 DP_STATUS_WW       = 2052    # Status WW             U8  (8 = charging)
+DP_STATUS_HC       = 2051    # Heating Circuit Status U8 (9 = passive cooling)
 DP_HEAT_GEN        = 7       # Wärmeerzeuger-Ist     S16 dec=1 °C  ← COP input
 DP_THERMAL_POWER   = 29051   # Current Heating Power U32 dec=1 kW
 DP_MODULATION      = 20052   # Compressor Modulation U8  %         ← COP input
 
 DHW_STATUS_CHARGING = 8
+HC_STATUS_PASSIVE_COOLING = 9   # status_heating_circuit value for passive cooling
 
 # ── Dynamic COP formula ───────────────────────────────────────────────────
 # Two-regime model using live temperature lift.
@@ -169,6 +179,9 @@ def dp_signal(entry_id: str, dp_id: int) -> str:
 
 def heater_signal(entry_id: str) -> str:
     return f"{DOMAIN}_{entry_id}_electric_heater"
+
+def cooling_signal(entry_id: str) -> str:
+    return f"{DOMAIN}_{entry_id}_passive_cooling"
 
 def connection_signal(entry_id: str) -> str:
     return f"{DOMAIN}_{entry_id}_connection"

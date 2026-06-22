@@ -20,7 +20,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from .const import (
     DOMAIN, PERSISTENT_DPIDS, SENSOR_DESCRIPTIONS,
     DP_HEAT_GEN, DP_MODULATION, DP_THERMAL_POWER,
-    connection_signal, dp_signal, heater_signal,
+    connection_signal, cooling_signal, dp_signal, heater_signal,
 )
 from .coordinator import HovalCANCoordinator
 
@@ -42,6 +42,8 @@ async def async_setup_entry(
         HovalDynamicCOPSensor(coord, entry),
         HovalElectricHeaterPowerSensor(coord, entry),
         HovalElectricHeaterEnergySensor(coord, entry),
+        HovalPassiveCoolingPowerSensor(coord, entry),
+        HovalPassiveCoolingEnergySensor(coord, entry),
         HovalHeatPumpElecPowerSensor(coord, entry),
         HovalHeatPumpElecEnergySensor(coord, entry),
         HovalTotalElecPowerSensor(coord, entry),
@@ -317,6 +319,146 @@ class HovalElectricHeaterEnergySensor(HovalBaseEntity, RestoreEntity):
         return round(self._total_kwh + extra, 3)
 
 
+# ── Passive cooling: power ─────────────────────────────────────────────────
+
+class HovalPassiveCoolingPowerSensor(HovalBaseEntity):
+    """Instantaneous electrical power drawn during passive ("free") cooling.
+
+    Returns cooling_power_kw (configurable, default 0.1 kW = 100 W) when the
+    heating circuit reports passive-cooling mode (status 9), 0.0 otherwise.
+    Unknown until the Heating Circuit Status datapoint is first received."""
+    _attr_device_class               = SensorDeviceClass.POWER
+    _attr_state_class                = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "kW"
+    _attr_icon                       = "mdi:snowflake"
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id    = f"{entry.entry_id}_passive_cooling_power"
+        self._attr_name         = "Passive Cooling Power"
+        self._attr_native_value = None
+        self._has_value         = False
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, cooling_signal(self._entry.entry_id), self._update,
+            )
+        )
+
+    @callback
+    def _update(self) -> None:
+        state = self._coord.passive_cooling_on
+        if state is None and not self._has_value:
+            return
+        if state is not None:
+            self._has_value = True
+            self._attr_native_value = (
+                self._coord.cooling_power_kw if state else 0.0
+            )
+        self.async_write_ha_state()
+
+
+# ── Passive cooling: energy ────────────────────────────────────────────────
+
+class HovalPassiveCoolingEnergySensor(HovalBaseEntity, RestoreEntity):
+    """Cumulative electrical energy consumed during passive cooling (kWh).
+
+    Power = coordinator.cooling_power_kw (configurable, default 0.1 kW).
+    Mirrors the electric-heater energy sensor exactly: monotonic-clock
+    integration, open interval discarded on disconnect, restores across
+    restarts, only ever increases, 3-decimal precision."""
+    _attr_device_class               = SensorDeviceClass.ENERGY
+    _attr_state_class                = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_icon                       = "mdi:snowflake-thermometer"
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id    = f"{entry.entry_id}_passive_cooling_energy"
+        self._attr_name         = "Passive Cooling Energy"
+        self._total_kwh         = 0.0
+        self._on_since: float | None = None
+        self._unsub             = None
+        self._attr_native_value = 0.0
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if (last := await self.async_get_last_state()) is not None:
+            if last.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE, None):
+                try:
+                    v = float(last.state)
+                    if v >= 0.0:
+                        self._total_kwh = v
+                        self._attr_native_value = round(v, 3)
+                        _LOGGER.debug(
+                            "Hoval CAN: restored passive_cooling_energy=%.3f kWh", v)
+                except (ValueError, TypeError):
+                    pass
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, cooling_signal(self._entry.entry_id), self._on_cooling,
+            )
+        )
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, connection_signal(self._entry.entry_id),
+                self._on_conn,
+            )
+        )
+        self._unsub = async_track_time_interval(
+            self.hass, self._tick, _ENERGY_INTERVAL
+        )
+        self.async_on_remove(self._cleanup)
+
+    @callback
+    def _on_conn(self) -> None:
+        # Drop the open "cooling on" interval on disconnect; otherwise a later
+        # off-transition/cleanup would flush the entire downtime as energy.
+        if not self._coord.connected:
+            self._on_since = None
+
+    def _cleanup(self) -> None:
+        if self._unsub:
+            self._unsub(); self._unsub = None
+        if self._on_since is not None:
+            self._flush(time.monotonic())
+
+    @callback
+    def _on_cooling(self) -> None:
+        is_on = self._coord.passive_cooling_on
+        if is_on is None:
+            return
+        now = time.monotonic()
+        if is_on and self._on_since is None:
+            self._on_since = now
+        elif not is_on and self._on_since is not None:
+            self._flush(now)
+        self._attr_native_value = self._live(now)
+        self.async_write_ha_state()
+
+    @callback
+    def _tick(self, now: datetime) -> None:
+        # `now` (wall clock) ignored; monotonic clock for integrity.
+        if self._on_since is not None:
+            self._attr_native_value = self._live(time.monotonic())
+            self.async_write_ha_state()
+
+    def _flush(self, now: float) -> None:
+        if self._on_since is not None:
+            h = max(0.0, (now - self._on_since) / 3600.0)
+            self._total_kwh += h * self._coord.cooling_power_kw
+            self._on_since = None
+
+    def _live(self, now: float) -> float:
+        extra = 0.0
+        if self._on_since is not None:
+            extra = (max(0.0, (now - self._on_since) / 3600.0)
+                     * self._coord.cooling_power_kw)
+        return round(self._total_kwh + extra, 3)
+
+
 # ── Heat pump electrical: power ────────────────────────────────────────────
 
 class HovalHeatPumpElecPowerSensor(HovalBaseEntity):
@@ -475,6 +617,7 @@ class HovalTotalElecPowerSensor(HovalBaseEntity):
             dp_signal(self._entry.entry_id, DP_MODULATION),
             dp_signal(self._entry.entry_id, DP_HEAT_GEN),
             heater_signal(self._entry.entry_id),
+            cooling_signal(self._entry.entry_id),
         ):
             self.async_on_remove(
                 async_dispatcher_connect(self.hass, sig, self._update)
@@ -490,7 +633,12 @@ class HovalTotalElecPowerSensor(HovalBaseEntity):
             cop         = self._coord.cop
             hp_elec     = 0.0 if (cop == 0.0 or thermal == 0.0) else thermal / cop
             heater_elec = self._coord.heater_power_kw if heater_on else 0.0
-            self._attr_native_value = round(hp_elec + heater_elec, 3)
+            # Passive cooling: only add when actively cooling. Unknown/None is
+            # treated as 0 so installs without a cooling circuit never regress.
+            cooling_elec = (self._coord.cooling_power_kw
+                            if self._coord.passive_cooling_on else 0.0)
+            self._attr_native_value = round(
+                hp_elec + heater_elec + cooling_elec, 3)
         self.async_write_ha_state()
 
 
@@ -534,6 +682,7 @@ class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
         for sig in (
             dp_signal(self._entry.entry_id, DP_THERMAL_POWER),
             heater_signal(self._entry.entry_id),
+            cooling_signal(self._entry.entry_id),
         ):
             self.async_on_remove(
                 async_dispatcher_connect(self.hass, sig, self._update)
@@ -574,7 +723,11 @@ class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
             cop         = self._coord.cop
             hp_elec     = 0.0 if (cop == 0.0 or thermal == 0.0) else thermal / cop
             heater_elec = self._coord.heater_power_kw if heater_on else 0.0
-            new_kw      = hp_elec + heater_elec
+            # Passive cooling: only add when actively cooling. Unknown/None is
+            # treated as 0 so installs without a cooling circuit never regress.
+            cooling_elec = (self._coord.cooling_power_kw
+                            if self._coord.passive_cooling_on else 0.0)
+            new_kw      = hp_elec + heater_elec + cooling_elec
         self._integrate(now, new_kw)
         self._attr_native_value = round(self._total_kwh, 3)
         self.async_write_ha_state()
