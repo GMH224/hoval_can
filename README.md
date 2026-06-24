@@ -209,6 +209,22 @@ The Heizstab has no direct CAN-BUS datapoint. Detected as ON when:
 
 ## Changelog
 
+### v0.2.5 — Diagnostics / telemetry pack
+- **New diagnostic sensor entities** (category *diagnostic*), promoting the
+  health counters that were previously only attributes into first-class,
+  recordable/alarmable states: **Gateway Data Age** (s), **Gateway Reconnects**,
+  **Gateway Framing Errors**, and **Gateway Datapoints Decoded** (derive a
+  rate for throughput). These are recorded to long-term statistics and are
+  visible to state-based exporters (InfluxDB / Prometheus / MQTT); they stay
+  available while disconnected so staleness is observable.
+- **Downloadable config-entry diagnostics** (`diagnostics.py`): the
+  Settings → Devices & Services → "Download diagnostics" button now returns a
+  redacted JSON snapshot of connection health, options, derived states, and the
+  last-seen value of every decoded datapoint — for incident triage without
+  shell access. Host/IP and unique_id are redacted.
+- Tests extended for the snapshot structure, host redaction, missing-coordinator
+  handling, and each diagnostic sensor's value wiring.
+
 ### v0.2.4 — Passive cooling energy tracking
 - **New: passive ("free") cooling power & energy.** When the Heating Circuit
   Status (DpId 2051) reports passive cooling (value 9), the circulation-pump

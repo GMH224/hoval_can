@@ -31,6 +31,7 @@ import enum
 
 class _SDC(enum.Enum):
     TEMPERATURE = "temperature"; POWER = "power"; ENERGY = "energy"
+    DURATION = "duration"
 
 
 class _SC(enum.Enum):
@@ -62,6 +63,18 @@ _mod("homeassistant.components")
 _mod("homeassistant.components.sensor",
      SensorDeviceClass=_SDC, SensorStateClass=_SC,
      SensorEntity=type("SensorEntity", (), {}))
+
+
+def _redact(data, to_redact):
+    if isinstance(data, dict):
+        return {k: ("**REDACTED**" if k in to_redact else _redact(v, to_redact))
+                for k, v in data.items()}
+    if isinstance(data, list):
+        return [_redact(v, to_redact) for v in data]
+    return data
+
+
+_mod("homeassistant.components.diagnostics", async_redact_data=_redact)
 _mod("homeassistant.helpers")
 
 # Recording dispatcher so tests can assert which signals were emitted.
@@ -417,6 +430,90 @@ def test_cooling_sensors():
     approx("Total energy 1h@100W cooling -> 0.1 kWh", te._total_kwh, 0.1)
 
 
+def test_diagnostics():
+    print("== diagnostics: snapshot + sensors + redaction ==")
+    HC = const.DP_STATUS_HC
+
+    # decoded_count increments per decoded datapoint
+    co = _co()
+    expect("decoded_count starts at 0", co.decoded_count == 0)
+    co._update_dp(7, 45.5)
+    co._update_dp(HC, 9)
+    expect("decoded_count == 2 after 2 updates", co.decoded_count == 2)
+
+    # snapshot structure + named last_values + counters
+    snap = co.diagnostics_snapshot()
+    expect("snapshot has connection block", "connection" in snap)
+    expect("snapshot decoded_count", snap["connection"]["decoded_count"] == 2)
+    expect("snapshot datapoints_seen == 2", snap["datapoints_seen"] == 2)
+    expect("snapshot names dp7 -> heat_gen_temp",
+           "heat_gen_temp" in snap["last_values"])
+    expect("snapshot derived passive_cooling_on True",
+           snap["derived"]["passive_cooling_on"] is True)
+    co2 = _co_with_options({const.CONF_COOLING_POWER: 120})
+    expect("snapshot reports cooling_power_w in watts",
+           co2.diagnostics_snapshot()["options"]["cooling_power_w"] == 120.0)
+
+    # diagnostics.py end-to-end with host redaction
+    from hoval_can import diagnostics as DG
+
+    class FakeEntry2:
+        entry_id = "e1"; title = "Hoval"; version = 1
+        unique_id = "1.2.3.4:3113"
+        data = {"host": "1.2.3.4", "port": 3113}
+        options = {const.CONF_HEATER_POWER: 3.0, const.CONF_COOLING_POWER: 100}
+
+    fake_entry = FakeEntry2()
+    hass = types.SimpleNamespace(data={const.DOMAIN: {"e1": co}})
+    result = asyncio.run(
+        DG.async_get_config_entry_diagnostics(hass, fake_entry))
+    expect("diag redacts entry host",
+           result["entry"]["data"]["host"] == "**REDACTED**")
+    expect("diag redacts coordinator host",
+           result["coordinator"]["host"] == "**REDACTED**")
+    expect("diag redacts unique_id",
+           result["entry"]["unique_id"] == "**REDACTED**")
+    expect("diag keeps port visible",
+           result["coordinator"]["port"] == 3113)
+
+    # diagnostics handles missing coordinator gracefully
+    empty_hass = types.SimpleNamespace(data={const.DOMAIN: {}})
+    res2 = asyncio.run(
+        DG.async_get_config_entry_diagnostics(empty_hass, fake_entry))
+    expect("diag handles missing coordinator",
+           "error" in res2["coordinator"])
+
+    # diagnostic sensor native_value wiring
+    from hoval_can import sensor as S
+
+    class FakeC2:
+        last_data_age = 12.34
+        reconnect_count = 3
+        framing_errors = 1
+        decoded_count = 42
+
+    def nv(cls):
+        obj = object.__new__(cls)
+        obj._coord = FakeC2()
+        return obj.native_value
+
+    approx("DataAge sensor value", nv(S.HovalDataAgeSensor), 12.3)
+    expect("Reconnects sensor value", nv(S.HovalReconnectsSensor) == 3)
+    expect("FramingErrors sensor value", nv(S.HovalFramingErrorsSensor) == 1)
+    expect("DecodedCount sensor value", nv(S.HovalDecodedCountSensor) == 42)
+
+    class FakeC3:
+        last_data_age = None
+    expect("DataAge None before first data",
+           nv2(S.HovalDataAgeSensor, FakeC3()) is None)
+
+
+def nv2(cls, coord):
+    obj = object.__new__(cls)
+    obj._coord = coord
+    return obj.native_value
+
+
 def main():
     test_cop()
     test_decode()
@@ -425,6 +522,7 @@ def main():
     test_integrator_math()
     test_cooling_coordinator()
     test_cooling_sensors()
+    test_diagnostics()
     print()
     print("RESULT:", "ALL PASS" if not _fails else f"{len(_fails)} FAIL: {_fails}")
     sys.exit(1 if _fails else 0)

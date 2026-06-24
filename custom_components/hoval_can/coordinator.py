@@ -56,6 +56,7 @@ class HovalCANCoordinator:
         self._reconnect_count: int  = 0     # successful (re)connects after 1st
         self._last_error: str | None = None # last connection failure reason
         self._framing_errors: int   = 0     # cumulative frame desync events
+        self._decoded_count: int    = 0     # cumulative decoded datapoints
 
     # ── Public properties ─────────────────────────────────────────────────
 
@@ -123,6 +124,46 @@ class HovalCANCoordinator:
     def framing_errors(self) -> int:
         """Cumulative count of frame desync events (resyncs)."""
         return self._framing_errors
+
+    @property
+    def decoded_count(self) -> int:
+        """Cumulative number of datapoints decoded since load (throughput)."""
+        return self._decoded_count
+
+    def diagnostics_snapshot(self) -> dict[str, Any]:
+        """Structured health + last-seen-data snapshot for downloadable
+        config-entry diagnostics. Host/IP is redacted by the caller."""
+        named: dict[str, Any] = {}
+        for dp_id, value in sorted(self._data.items()):
+            desc = SENSOR_BY_DPID.get(dp_id)
+            key = desc.key if desc is not None else f"dp_{dp_id}"
+            named[key] = value
+        return {
+            "host": self._host,
+            "port": self._port,
+            "connection": {
+                "connected": self._connected,
+                "last_data_age_seconds": (
+                    None if self.last_data_age is None
+                    else round(self.last_data_age, 1)
+                ),
+                "reconnect_count": self._reconnect_count,
+                "framing_errors": self._framing_errors,
+                "decoded_count": self._decoded_count,
+                "last_error": self._last_error,
+            },
+            "options": {
+                "heater_power_kw": self.heater_power_kw,
+                "cooling_power_w": round(self.cooling_power_kw * 1000.0, 1),
+            },
+            "derived": {
+                "cop": self.cop,
+                "electric_heater_on": self.electric_heater_on,
+                "passive_cooling_on": self.passive_cooling_on,
+            },
+            "datapoints_seen": len(self._data),
+            "last_values": named,
+        }
 
     @property
     def electric_heater_on(self) -> bool | None:
@@ -428,6 +469,7 @@ class HovalCANCoordinator:
     def _update_dp(self, dp_id: int, value: Any) -> None:
         self._data[dp_id] = value
         self._last_data_mono = time.monotonic()   # feeds the data watchdog
+        self._decoded_count += 1
         async_dispatcher_send(self.hass, dp_signal(self._entry.entry_id, dp_id))
 
         if dp_id in (DP_STATUS_WW, DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_HEAT_GEN):

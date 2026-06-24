@@ -9,7 +9,9 @@ from homeassistant.components.sensor import (
     SensorDeviceClass, SensorEntity, SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfEnergy
+from homeassistant.const import (
+    STATE_UNAVAILABLE, STATE_UNKNOWN, EntityCategory, UnitOfEnergy,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
@@ -48,6 +50,12 @@ async def async_setup_entry(
         HovalHeatPumpElecEnergySensor(coord, entry),
         HovalTotalElecPowerSensor(coord, entry),
         HovalTotalElecEnergySensor(coord, entry),
+        # Diagnostic telemetry (promoted from connectivity-sensor attributes
+        # to first-class, recordable/alarmable entities).
+        HovalDataAgeSensor(coord, entry),
+        HovalReconnectsSensor(coord, entry),
+        HovalFramingErrorsSensor(coord, entry),
+        HovalDecodedCountSensor(coord, entry),
     ]
     async_add_entities(entities)
 
@@ -754,3 +762,94 @@ class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
         else:
             self._last_elec_kw = None
             self._last_ts      = None
+
+
+# ── Diagnostic telemetry ───────────────────────────────────────────────────
+
+class HovalDiagnosticSensor(SensorEntity):
+    """Base for polled diagnostic entities.
+
+    Promotes coordinator health counters (previously only attributes on the
+    connectivity binary_sensor) to first-class sensor states so they are
+    recorded to long-term statistics, graphable, alarmable, and visible to
+    state-based exporters (InfluxDB / Prometheus / MQTT). Polled rather than
+    pushed because values such as data-age change continuously and the
+    framing/decoded counters change inside the parser without a signal.
+
+    Stays available even while disconnected — surfacing health is the point.
+    """
+    _attr_has_entity_name = True
+    _attr_should_poll     = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coord: HovalCANCoordinator, entry: ConfigEntry) -> None:
+        self._coord = coord
+        self._entry = entry
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def available(self) -> bool:
+        return True
+
+
+class HovalDataAgeSensor(HovalDiagnosticSensor):
+    """Seconds since the last decoded datapoint (staleness)."""
+    _attr_device_class               = SensorDeviceClass.DURATION
+    _attr_state_class                = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "s"
+    _attr_icon                       = "mdi:timer-sand"
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id = f"{entry.entry_id}_diag_data_age"
+        self._attr_name      = "Gateway Data Age"
+
+    @property
+    def native_value(self):
+        age = self._coord.last_data_age
+        return None if age is None else round(age, 1)
+
+
+class HovalReconnectsSensor(HovalDiagnosticSensor):
+    """Cumulative successful reconnects since the integration loaded."""
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_icon        = "mdi:lan-pending"
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id = f"{entry.entry_id}_diag_reconnects"
+        self._attr_name      = "Gateway Reconnects"
+
+    @property
+    def native_value(self):
+        return self._coord.reconnect_count
+
+
+class HovalFramingErrorsSensor(HovalDiagnosticSensor):
+    """Cumulative frame desync events since the integration loaded."""
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_icon        = "mdi:alert-circle-outline"
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id = f"{entry.entry_id}_diag_framing_errors"
+        self._attr_name      = "Gateway Framing Errors"
+
+    @property
+    def native_value(self):
+        return self._coord.framing_errors
+
+
+class HovalDecodedCountSensor(HovalDiagnosticSensor):
+    """Cumulative decoded datapoints since load (derive rate for throughput)."""
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_icon        = "mdi:counter"
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id = f"{entry.entry_id}_diag_decoded_count"
+        self._attr_name      = "Gateway Datapoints Decoded"
+
+    @property
+    def native_value(self):
+        return self._coord.decoded_count
