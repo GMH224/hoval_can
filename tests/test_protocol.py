@@ -514,6 +514,86 @@ def nv2(cls, coord):
     return obj.native_value
 
 
+def test_rates():
+    print("== windowed rates ==")
+    wr = C._windowed_rate
+
+    # pure helper edge cases
+    expect("empty -> None", wr([], 10, 100.0, 900, 120) is None)
+    expect("warm-up (elapsed<min) -> None",
+           wr([(0.0, 0)], 5, 100.0, 900, 120) is None)
+    expect("all samples older than window -> None",
+           wr([(0.0, 0)], 5, 1000.0, 900, 120) is None)
+    # 10 events over 200 s -> 0.05/s
+    approx("rate 10/200s = 0.05/s", wr([(0.0, 0)], 10, 200.0, 900, 120), 0.05)
+    # flat window -> 0
+    approx("flat window -> 0",
+           wr([(0.0, 10), (60.0, 10)], 10, 200.0, 900, 120), 0.0)
+    # ref is the OLDEST sample within the window
+    approx("oldest-in-window ref",
+           wr([(0.0, 0), (100.0, 1)], 4, 200.0, 900, 120), 0.02)
+
+    # coordinator property wiring (deterministic clock)
+    real_mono = C.time.monotonic
+    try:
+        co = _co()
+        co._rate_samples.clear()
+        co._rate_samples.append((1000.0, 0, 0))   # t, errors, decoded
+        co._framing_errors = 2
+        co._decoded_count = 600
+        C.time.monotonic = lambda: 1200.0           # 200 s later
+        approx("throughput 600/200s -> 180/min",
+               co.decoded_rate_per_min, 180.0)
+        approx("error rate 2/200s -> 36/h",
+               co.framing_error_rate_per_h, 36.0)
+        C.time.monotonic = lambda: 1050.0           # only 50 s -> warm-up
+        expect("throughput None during warm-up",
+               co.decoded_rate_per_min is None)
+        expect("error rate None during warm-up",
+               co.framing_error_rate_per_h is None)
+
+        # _sample_rates appends and prunes > 60-min-old entries
+        co2 = _co()
+        co2._rate_samples.clear()
+        co2._rate_samples.append((0.0, 0, 0))       # very old
+        co2._framing_errors = 1
+        co2._decoded_count = 9
+        C.time.monotonic = lambda: 4000.0           # cutoff = 4000-3600 = 400
+        co2._sample_rates()
+        ts = [s[0] for s in co2._rate_samples]
+        expect("old sample pruned", 0.0 not in ts)
+        expect("new sample appended", 4000.0 in ts)
+        expect("latest snapshot carries counters",
+               co2._rate_samples[-1][1:] == (1, 9))
+    finally:
+        C.time.monotonic = real_mono
+
+    # snapshot exposes the rates
+    snap = _co().diagnostics_snapshot()
+    expect("snapshot has decoded_rate_per_min",
+           "decoded_rate_per_min" in snap["connection"])
+    expect("snapshot has framing_error_rate_per_h",
+           "framing_error_rate_per_h" in snap["connection"])
+
+    # sensor native_value wiring
+    from hoval_can import sensor as S
+
+    class FakeR:
+        decoded_rate_per_min = 142.7
+        framing_error_rate_per_h = 3.456
+
+    approx("throughput sensor value", nv2(S.HovalThroughputSensor, FakeR()),
+           142.7, tol=0.05)
+    approx("error-rate sensor value",
+           nv2(S.HovalFramingErrorRateSensor, FakeR()), 3.46, tol=0.005)
+
+    class FakeRn:
+        decoded_rate_per_min = None
+        framing_error_rate_per_h = None
+    expect("throughput sensor None passthrough",
+           nv2(S.HovalThroughputSensor, FakeRn()) is None)
+
+
 def main():
     test_cop()
     test_decode()
@@ -523,6 +603,7 @@ def main():
     test_cooling_coordinator()
     test_cooling_sensors()
     test_diagnostics()
+    test_rates()
     print()
     print("RESULT:", "ALL PASS" if not _fails else f"{len(_fails)} FAIL: {_fails}")
     sys.exit(1 if _fails else 0)

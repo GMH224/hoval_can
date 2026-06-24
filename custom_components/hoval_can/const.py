@@ -28,6 +28,16 @@ DATA_STALE_TIMEOUT = 300  # s without a DECODABLE datapoint → force reconnect.
 MAX_RX_BUFFER  = 65536    # bytes — hard cap on the un-split RX buffer
 RX_RESYNC_KEEP = 1024     # bytes retained after an overflow to allow resync
 
+# ── Windowed telemetry rates (sliding window over periodic snapshots) ───────
+# A bounded ring of (timestamp, framing_errors, decoded_count) snapshots taken
+# every RATE_SAMPLE_INTERVAL feeds two derived rates. Cumulative counters are
+# retained underneath for exporters / HA's own Derivative & Statistics helpers.
+RATE_SAMPLE_INTERVAL  = 60     # s between rate snapshots
+THROUGHPUT_WINDOW_S   = 3600   # s (60 min) window for decoded-datapoints/min
+ERROR_RATE_WINDOW_S   = 900    # s (15 min) window for framing-errors/hour
+RATE_MIN_ELAPSED_S    = 120    # s minimum span before a rate is reported
+                               # (else None/"unknown" during warm-up)
+
 # ── TCP keep-alive (defense in depth: lets the OS surface a dead peer) ──────
 # asyncio.open_connection() does NOT enable SO_KEEPALIVE by default, so a
 # half-open connection (gateway reboot / Wi-Fi drop with no FIN/RST) would

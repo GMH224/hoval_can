@@ -7,11 +7,14 @@ import random
 import socket
 import struct
 import time
+from collections import deque
+from datetime import timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
     CMD_READ_RESP_BE, CMD_READ_RESP_LE,
@@ -19,6 +22,8 @@ from .const import (
     CONF_COOLING_POWER, DEFAULT_COOLING_POWER_W,
     FRAME_END, FRAME_SEP, FRAME_TIMEOUT, STALE_TIMEOUT,
     DATA_STALE_TIMEOUT, MAX_RX_BUFFER, RX_RESYNC_KEEP,
+    RATE_SAMPLE_INTERVAL, THROUGHPUT_WINDOW_S, ERROR_RATE_WINDOW_S,
+    RATE_MIN_ELAPSED_S,
     HEATER_DETECTION_MARGIN, NULL_SENTINELS,
     RECONNECT_DELAY, RECONNECT_DELAY_MAX, RECONNECT_BACKOFF,
     SCHEDULE_GROUPS, SENSOR_BY_DPID, STRUCT_FMT, TBYTES,
@@ -31,6 +36,28 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _windowed_rate(samples, current_value: int, now: float,
+                   window_s: float, min_elapsed_s: float):
+    """Sliding-window rate, in units per second, or None if not yet meaningful.
+
+    ``samples`` is an oldest→newest iterable of (monotonic_t, value). The
+    reference is the oldest snapshot still inside the window, so the rate spans
+    up to ``window_s``. ``current_value`` (the live counter) and ``now`` form
+    the leading edge — this keeps the rate correct when the stream goes idle
+    (counter flat ⇒ rate decays to 0) without needing a fresh snapshot."""
+    ref = None
+    for t, v in samples:
+        if now - t <= window_s:      # oldest snapshot within the window
+            ref = (t, v)
+            break
+    if ref is None:
+        return None
+    elapsed = now - ref[0]
+    if elapsed < min_elapsed_s:
+        return None
+    return (current_value - ref[1]) / elapsed
 
 
 class HovalCANCoordinator:
@@ -57,6 +84,13 @@ class HovalCANCoordinator:
         self._last_error: str | None = None # last connection failure reason
         self._framing_errors: int   = 0     # cumulative frame desync events
         self._decoded_count: int    = 0     # cumulative decoded datapoints
+        # Sliding-window rate snapshots: (monotonic_t, framing_errors,
+        # decoded_count). Bounded by maxlen as a hard belt-and-suspenders cap
+        # on top of age-based pruning.
+        self._rate_samples: deque = deque(
+            maxlen=(THROUGHPUT_WINDOW_S // RATE_SAMPLE_INTERVAL) + 5
+        )
+        self._rate_unsub = None
 
     # ── Public properties ─────────────────────────────────────────────────
 
@@ -130,6 +164,38 @@ class HovalCANCoordinator:
         """Cumulative number of datapoints decoded since load (throughput)."""
         return self._decoded_count
 
+    @property
+    def decoded_rate_per_min(self) -> float | None:
+        """Decoded datapoints per minute over a sliding 60-min window."""
+        per_s = _windowed_rate(
+            [(t, d) for (t, _e, d) in self._rate_samples],
+            self._decoded_count, time.monotonic(),
+            THROUGHPUT_WINDOW_S, RATE_MIN_ELAPSED_S,
+        )
+        return None if per_s is None else max(0.0, per_s * 60.0)
+
+    @property
+    def framing_error_rate_per_h(self) -> float | None:
+        """Framing errors per hour over a sliding 15-min window."""
+        per_s = _windowed_rate(
+            [(t, e) for (t, e, _d) in self._rate_samples],
+            self._framing_errors, time.monotonic(),
+            ERROR_RATE_WINDOW_S, RATE_MIN_ELAPSED_S,
+        )
+        return None if per_s is None else max(0.0, per_s * 3600.0)
+
+    def _sample_rates(self, now=None) -> None:
+        """Append a rate snapshot and prune anything older than the longest
+        window. Driven by a 60-s HA timer; also called once at start so the
+        warm-up window begins immediately."""
+        mono = time.monotonic()
+        self._rate_samples.append(
+            (mono, self._framing_errors, self._decoded_count)
+        )
+        cutoff = mono - THROUGHPUT_WINDOW_S
+        while self._rate_samples and self._rate_samples[0][0] < cutoff:
+            self._rate_samples.popleft()
+
     def diagnostics_snapshot(self) -> dict[str, Any]:
         """Structured health + last-seen-data snapshot for downloadable
         config-entry diagnostics. Host/IP is redacted by the caller."""
@@ -150,6 +216,8 @@ class HovalCANCoordinator:
                 "reconnect_count": self._reconnect_count,
                 "framing_errors": self._framing_errors,
                 "decoded_count": self._decoded_count,
+                "decoded_rate_per_min": self.decoded_rate_per_min,
+                "framing_error_rate_per_h": self.framing_error_rate_per_h,
                 "last_error": self._last_error,
             },
             "options": {
@@ -228,9 +296,18 @@ class HovalCANCoordinator:
             )
         else:  # pragma: no cover - legacy cores
             self._task = self.hass.loop.create_task(coro, name=name)
+        # Seed the rate window now and sample every RATE_SAMPLE_INTERVAL.
+        self._sample_rates()
+        self._rate_unsub = async_track_time_interval(
+            self.hass, self._sample_rates,
+            timedelta(seconds=RATE_SAMPLE_INTERVAL),
+        )
 
     async def async_stop(self) -> None:
         self._stop = True
+        if self._rate_unsub:
+            self._rate_unsub()
+            self._rate_unsub = None
         if self._task:
             self._task.cancel()
             try:

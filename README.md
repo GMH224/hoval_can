@@ -209,6 +209,26 @@ The Heizstab has no direct CAN-BUS datapoint. Detected as ON when:
 
 ## Changelog
 
+### v0.2.6 — Windowed health rates
+- **New rate sensors** (diagnostic), giving an at-a-glance health read instead
+  of raw cumulative counters: **Gateway Throughput** (decoded datapoints/min,
+  sliding 60-min window) and **Gateway Framing Error Rate** (errors/hour,
+  sliding 15-min window). Together with **Gateway Data Age** these form a
+  RED-style triad — Rate (throughput), Errors (error rate), Duration
+  (freshness) — that cleanly disambiguates "stream dirty" from "link down".
+- Rates are computed from a bounded ring of 60-second snapshots (≈60 samples,
+  hard-capped); restart-robust; report *unknown* during a short warm-up. The
+  leading edge uses the live counters, so a stalled stream decays the rate to 0
+  rather than freezing it. The cumulative counters are retained for exporters
+  and for HA's own Derivative/Statistics helpers.
+- A throughput-normalised *errors-per-decoded* ratio was deliberately **not**
+  shipped: its denominator collapses exactly when the stream stalls (the worst
+  moment), and for this near-constant-cadence device the windowed error *rate*
+  conveys the same health without that instability.
+- Rates added to the downloadable diagnostics; tests extended (pure rate
+  function edge cases, property wiring with a deterministic clock, prune logic,
+  sensor passthrough). Suite total: 86 assertions, all pass.
+
 ### v0.2.5 — Diagnostics / telemetry pack
 - **New diagnostic sensor entities** (category *diagnostic*), promoting the
   health counters that were previously only attributes into first-class,

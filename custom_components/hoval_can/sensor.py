@@ -56,6 +56,8 @@ async def async_setup_entry(
         HovalReconnectsSensor(coord, entry),
         HovalFramingErrorsSensor(coord, entry),
         HovalDecodedCountSensor(coord, entry),
+        HovalThroughputSensor(coord, entry),
+        HovalFramingErrorRateSensor(coord, entry),
     ]
     async_add_entities(entities)
 
@@ -853,3 +855,46 @@ class HovalDecodedCountSensor(HovalDiagnosticSensor):
     @property
     def native_value(self):
         return self._coord.decoded_count
+
+
+class HovalThroughputSensor(HovalDiagnosticSensor):
+    """Decoded datapoints per minute (sliding 60-min window).
+
+    The 'is data flowing' signal: drops toward 0 when the stream stalls, so it
+    pairs with Data Age to distinguish a quiet link from a dead one. Unknown
+    during the warm-up window after (re)load."""
+    _attr_state_class                = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "datapoints/min"
+    _attr_icon                       = "mdi:speedometer"
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id = f"{entry.entry_id}_diag_throughput"
+        self._attr_name      = "Gateway Throughput"
+
+    @property
+    def native_value(self):
+        rate = self._coord.decoded_rate_per_min
+        return None if rate is None else round(rate, 1)
+
+
+class HovalFramingErrorRateSensor(HovalDiagnosticSensor):
+    """Framing errors per hour (sliding 15-min window).
+
+    The 'is the stream clean' signal — restart-robust and directly alertable
+    (e.g. notify if > N/h). Because the device streams at a near-constant
+    cadence, this tracks parser health without the denominator instability of
+    an errors-per-decoded ratio. Unknown during the warm-up window."""
+    _attr_state_class                = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "errors/h"
+    _attr_icon                       = "mdi:alert-decagram-outline"
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id = f"{entry.entry_id}_diag_framing_error_rate"
+        self._attr_name      = "Gateway Framing Error Rate"
+
+    @property
+    def native_value(self):
+        rate = self._coord.framing_error_rate_per_h
+        return None if rate is None else round(rate, 2)
