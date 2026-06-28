@@ -1,6 +1,6 @@
 # CLAUDE.md — Hoval CAN Integration Developer Context
 
-Version 0.2.7. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
+Version 0.2.8. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
 Read-only. TCP port 3113, proprietary CAN-BUS stream.
 
 ---

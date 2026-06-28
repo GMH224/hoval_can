@@ -1,7 +1,7 @@
 # Hoval CAN — Home Assistant Integration
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz)
-![Version](https://img.shields.io/badge/version-0.2.7-blue)
+![Version](https://img.shields.io/badge/version-0.2.8-blue)
 ![HA min version](https://img.shields.io/badge/HA-2023.1%2B-green)
 
 Local-push integration for Hoval heat pump systems with the **WLAN Gateway**. Connects to the proprietary CAN-BUS TCP stream on port 3113. No cloud, no Modbus module required. Strictly **read-only** — nothing is ever written to the bus.
@@ -215,6 +215,17 @@ lags and condition 3 alone would briefly read true. Verified against a full
 ---
 
 ## Changelog
+
+### v0.2.8 — Total electrical zero-fills unknown inputs
+- **Total Electrical Power/Energy now zero-fill unknown inputs** instead of
+  reading *unknown* whenever any single input is absent. On CAN some datapoints
+  (e.g. `status_dhw`) stay dormant until the heat pump engages, which previously
+  blanked the total — and dropped passive-cooling energy — through long
+  cooling-only spells. A genuinely dead/stalled link is still surfaced via the
+  entity `available` state (connection + data watchdog), so this only affects
+  not-yet-seen datapoints, where 0 is the honest contribution. The standalone
+  *Heat Pump Electrical Power* sensor is unchanged (single-term, stays unknown
+  until thermal power is first seen).
 
 ### v0.2.7 — Heizstab DHW-priority fix
 - **Fixed false electric-heater (Heizstab) ON pulses** during heat-pump DHW

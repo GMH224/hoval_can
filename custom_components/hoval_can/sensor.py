@@ -607,8 +607,10 @@ class HovalHeatPumpElecEnergySensor(HovalBaseEntity, RestoreEntity):
 # ── Total electrical: power ────────────────────────────────────────────────
 
 class HovalTotalElecPowerSensor(HovalBaseEntity):
-    """Total instantaneous electrical power: heat pump + electric heater.
-    Unknown until both sources are available. 3-decimal precision."""
+    """Total instantaneous electrical power: heat pump + electric heater +
+    passive cooling. Unknown inputs are treated as 0 (see `_update`), so the
+    total reports known loads even before every datapoint has been broadcast;
+    a dead/stalled link is surfaced via `available`. 3-decimal precision."""
     _attr_device_class               = SensorDeviceClass.POWER
     _attr_state_class                = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = "kW"
@@ -635,31 +637,37 @@ class HovalTotalElecPowerSensor(HovalBaseEntity):
 
     @callback
     def _update(self) -> None:
+        # Zero-fill unknown inputs rather than blanking the whole total. A dead
+        # or stalled gateway is already surfaced via `available` (coordinator
+        # `connected` + data watchdog), so an input that is None while the
+        # entity is available means only that its datapoint has not been
+        # broadcast yet (e.g. status_dhw stays dormant through long passive-
+        # cooling spells on CAN). Treating that as 0 lets the total still report
+        # known loads such as passive cooling instead of reading "unknown".
         thermal   = self._coord.get_value(DP_THERMAL_POWER)
         heater_on = self._coord.electric_heater_on
-        if thermal is None or heater_on is None:
-            self._attr_native_value = None
-        else:
-            cop         = self._coord.cop
-            hp_elec     = 0.0 if (cop == 0.0 or thermal == 0.0) else thermal / cop
-            heater_elec = self._coord.heater_power_kw if heater_on else 0.0
-            # Passive cooling: only add when actively cooling. Unknown/None is
-            # treated as 0 so installs without a cooling circuit never regress.
-            cooling_elec = (self._coord.cooling_power_kw
-                            if self._coord.passive_cooling_on else 0.0)
-            self._attr_native_value = round(
-                hp_elec + heater_elec + cooling_elec, 3)
+        cop       = self._coord.cop
+        hp_elec   = (0.0 if (thermal is None or thermal == 0.0 or cop == 0.0)
+                     else thermal / cop)
+        heater_elec  = self._coord.heater_power_kw if heater_on else 0.0
+        cooling_elec = (self._coord.cooling_power_kw
+                        if self._coord.passive_cooling_on else 0.0)
+        self._attr_native_value = round(hp_elec + heater_elec + cooling_elec, 3)
         self.async_write_ha_state()
 
 
 # ── Total electrical: energy ───────────────────────────────────────────────
 
 class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
-    """Total cumulative electrical energy: heat pump + electric heater (kWh).
+    """Total cumulative electrical energy: heat pump + electric heater +
+    passive cooling (kWh).
 
     Independent persistent counter — not a runtime sum of sub-sensors.
     Integrates on every DpId=29051 update and heater state change.
     60-second timer keeps value current between infrequent heater events.
+    Unknown inputs are treated as 0 (see Total Electrical Power), so cooling
+    energy keeps integrating through passive-cooling spells even before
+    status_dhw has been broadcast; the integrator only pauses on disconnect.
     • Starts at 0.0; restores across restarts; only increases; 3 decimals.
     """
     _attr_device_class               = SensorDeviceClass.ENERGY
@@ -724,20 +732,19 @@ class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
 
     @callback
     def _update(self) -> None:
+        # Zero-fill unknown inputs (see Total Electrical Power). new_kw stays a
+        # number whenever the entity is available, so cooling energy keeps
+        # integrating through passive-cooling spells when status_dhw is dormant.
         now       = time.monotonic()
         thermal   = self._coord.get_value(DP_THERMAL_POWER)
         heater_on = self._coord.electric_heater_on
-        if thermal is None or heater_on is None:
-            new_kw = None
-        else:
-            cop         = self._coord.cop
-            hp_elec     = 0.0 if (cop == 0.0 or thermal == 0.0) else thermal / cop
-            heater_elec = self._coord.heater_power_kw if heater_on else 0.0
-            # Passive cooling: only add when actively cooling. Unknown/None is
-            # treated as 0 so installs without a cooling circuit never regress.
-            cooling_elec = (self._coord.cooling_power_kw
-                            if self._coord.passive_cooling_on else 0.0)
-            new_kw      = hp_elec + heater_elec + cooling_elec
+        cop       = self._coord.cop
+        hp_elec   = (0.0 if (thermal is None or thermal == 0.0 or cop == 0.0)
+                     else thermal / cop)
+        heater_elec  = self._coord.heater_power_kw if heater_on else 0.0
+        cooling_elec = (self._coord.cooling_power_kw
+                        if self._coord.passive_cooling_on else 0.0)
+        new_kw    = hp_elec + heater_elec + cooling_elec
         self._integrate(now, new_kw)
         self._attr_native_value = round(self._total_kwh, 3)
         self.async_write_ha_state()
