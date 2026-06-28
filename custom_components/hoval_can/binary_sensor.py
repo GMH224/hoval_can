@@ -30,14 +30,19 @@ async def async_setup_entry(
 class HovalElectricHeaterBinarySensor(BinarySensorEntity):
     """True when the electric DHW heater (Heizstab) is active.
 
-    Detection: ON when all three hold simultaneously:
+    Detection: ON when all hold simultaneously:
       1. DHW Status == 8  (system is charging DHW tank)
       2. DHW Temperature < DHW Setpoint  (target not yet reached)
       3. Heat Generator Temp ≤ DHW Temp + 5 °C
          (heat pump generator not hot enough to heat tank — electric only)
+      4. Compressor modulation ≤ 1 %  (compressor not running)
 
-    Winter-safe: even when the heat pump runs at 40 °C for space heating,
-    a 55 °C+ DHW tank is hotter than the generator; condition 3 fires.
+    Condition 4 reflects DHW priority: a single compressor cannot charge the
+    tank and heat the house at once, so while the tank is charging a running
+    compressor is itself doing the heating and the Heizstab is off. It only
+    finishes the charge after the heat pump stops. This suppresses false ON
+    pulses during the compressor's DHW-charge ramp, when the generator
+    temperature lags and condition 3 alone would briefly read true.
     """
 
     _attr_has_entity_name = True

@@ -97,6 +97,13 @@ NULL_SENTINELS: dict[str, set] = {
 # ── Electric heater detection ──────────────────────────────────────────────
 HEATER_DETECTION_MARGIN: float = 5.0   # °C
 
+# Compressor is considered "running" above this modulation (%). Matches the
+# calculate_cop() "not running" threshold (modulation <= 1.0). Used by the
+# electric-heater detection: under DHW priority a running compressor is itself
+# charging the tank, so the Heizstab is treated as off while modulation exceeds
+# this value. The Heizstab is only detected once the compressor has stopped.
+COMPRESSOR_RUNNING_MODULATION: float = 1.0   # %
+
 # Key DatapointIds
 DP_DHW_ACTUAL      = 4       # Warmwasser-Ist        S16 dec=1 °C
 DP_DHW_SETPOINT    = 1004    # Warmwasser-Soll       S16 dec=1 °C

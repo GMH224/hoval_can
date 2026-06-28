@@ -1,7 +1,7 @@
 # Hoval CAN — Home Assistant Integration
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz)
-![Version](https://img.shields.io/badge/version-0.2.1-blue)
+![Version](https://img.shields.io/badge/version-0.2.7-blue)
 ![HA min version](https://img.shields.io/badge/HA-2023.1%2B-green)
 
 Local-push integration for Hoval heat pump systems with the **WLAN Gateway**. Connects to the proprietary CAN-BUS TCP stream on port 3113. No cloud, no Modbus module required. Strictly **read-only** — nothing is ever written to the bus.
@@ -202,12 +202,35 @@ The Heizstab has no direct CAN-BUS datapoint. Detected as ON when:
 1. DHW Status == 8 (DHW charging active)
 2. DHW Temperature < DHW Setpoint
 3. Heat Generator Temp ≤ DHW Temp + 5 °C (pump generator too cool to heat tank)
+4. Compressor Modulation ≤ 1 % (compressor not running)
 
-**Winter-safe:** heat pump at 40 °C for space heating cannot heat a 55 °C+ DHW tank; condition 3 fires correctly. Verified against a full 62 °C DHW capture.
+**DHW priority:** a single compressor cannot heat the house and the DHW tank at
+once (3-way diverter / DHW takes priority), so while the tank is charging a
+running compressor is itself doing the heating and the Heizstab is off — it only
+finishes the charge once the heat pump stops. Condition 4 removes false ON
+pulses during the compressor's DHW-charge ramp, when the generator temperature
+lags and condition 3 alone would briefly read true. Verified against a full
+62 °C DHW capture.
 
 ---
 
 ## Changelog
+
+### v0.2.7 — Heizstab DHW-priority fix
+- **Fixed false electric-heater (Heizstab) ON pulses** during heat-pump DHW
+  charging. The detection now also requires the compressor to be off
+  (modulation ≤ 1 %): under DHW priority a running compressor is itself heating
+  the tank, so the Heizstab is reported off until the heat pump stops and
+  finishes the charge electrically. This removes the spurious 4 kW spikes,
+  including the compressor start-up window where the generator temperature lags
+  below the tank and the previous temperature-only test briefly read true.
+- The fix flows through automatically to **Electric Heater Power/Energy** and to
+  **Total Electrical Power/Energy**, which all derive from the same
+  `electric_heater_on` signal. (Energy counters correct going forward only;
+  reset their stored state if you want a clean baseline.)
+- Heater state now also recomputes on **Compressor Modulation** (DpId 20052)
+  updates, so the off transition propagates immediately.
+- Docs (README, CLAUDE.md) updated to document condition 4.
 
 ### v0.2.6 — Windowed health rates
 - **New rate sensors** (diagnostic), giving an at-a-glance health read instead

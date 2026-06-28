@@ -1,6 +1,6 @@
 # CLAUDE.md — Hoval CAN Integration Developer Context
 
-Version 0.2.1. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
+Version 0.2.7. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
 Read-only. TCP port 3113, proprietary CAN-BUS stream.
 
 ---
@@ -93,9 +93,14 @@ Piecewise coefficients (0.5833, 7.0, 7.988, 0.0449, 4.626, 0.0417, 3.679, 0.0130
 ## Electric heater detection (coordinator.electric_heater_on)
 
 ```python
-heater_on = (status_ww == 8 and dhw < dhw_sp and heat_gen <= dhw + 5.0)
+heater_on = (status_ww == 8 and dhw < dhw_sp
+             and heat_gen <= dhw + 5.0
+             and modulation <= 1.0)   # DHW priority: running compressor = HP charging tank
 ```
-Returns None until all four DpIds received. Winter-safe by design.
+Returns None until all four temp/status DpIds received. DHW-priority by design:
+while charging, a running compressor is itself heating the tank, so the Heizstab
+is off; it only finishes once the compressor stops. Recomputed on updates to
+status_ww / dhw / dhw_sp / heat_gen / modulation.
 Rated power from `entry.options["heater_power_kw"]` (default 3.0 kW).
 
 ---

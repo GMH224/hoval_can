@@ -31,6 +31,7 @@ from .const import (
     DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_STATUS_WW,
     DP_STATUS_HC, HC_STATUS_PASSIVE_COOLING,
     DP_HEAT_GEN, DP_MODULATION, DHW_STATUS_CHARGING,
+    COMPRESSOR_RUNNING_MODULATION,
     calculate_cop,
     connection_signal, cooling_signal, dp_signal, heater_signal,
 )
@@ -237,13 +238,23 @@ class HovalCANCoordinator:
     def electric_heater_on(self) -> bool | None:
         """True when the Heizstab is active (derived — no direct DpId).
 
-        ON when all three hold:
+        ON when all of:
           1. DHW charging (status_ww == 8)
           2. DHW below setpoint
-          3. Generator ≤ DHW + 5 °C  (heat pump can't heat the tank)
+          3. Generator ≤ DHW + 5 °C  (heat pump generator not hot), AND
+          4. the compressor is not running (modulation ≤ 1 %).
 
-        Winter-safe: heat pump at 40 °C for space heating cannot heat a
-        55 °C+ DHW tank; condition 3 fires correctly.
+        Condition 4 reflects DHW priority: a single compressor cannot heat the
+        house and the DHW tank at the same time (3-way diverter / DHW takes
+        priority), so while the tank is charging, any compressor modulation
+        means the heat pump itself is doing the heating and the Heizstab is off.
+        The Heizstab only finishes the charge once the heat pump has stopped
+        (modulation = 0). This removes the false ON pulses that condition 3
+        alone produced while the compressor ramped up and the generator
+        temperature still lagged below the tank.
+
+        Missing modulation is treated as 0 (compressor off), preserving the
+        original behaviour until that DpId is first seen.
         """
         status_ww  = self._data.get(DP_STATUS_WW)
         dhw_actual = self._data.get(DP_DHW_ACTUAL)
@@ -251,10 +262,13 @@ class HovalCANCoordinator:
         heat_gen   = self._data.get(DP_HEAT_GEN)
         if None in (status_ww, dhw_actual, dhw_sp, heat_gen):
             return None
+        modulation = self._data.get(DP_MODULATION) or 0.0
+        compressor_running = modulation > COMPRESSOR_RUNNING_MODULATION
         return bool(
             status_ww == DHW_STATUS_CHARGING
             and dhw_actual < dhw_sp
             and heat_gen <= dhw_actual + HEATER_DETECTION_MARGIN
+            and not compressor_running
         )
 
     @property
@@ -549,7 +563,8 @@ class HovalCANCoordinator:
         self._decoded_count += 1
         async_dispatcher_send(self.hass, dp_signal(self._entry.entry_id, dp_id))
 
-        if dp_id in (DP_STATUS_WW, DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_HEAT_GEN):
+        if dp_id in (DP_STATUS_WW, DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_HEAT_GEN,
+                     DP_MODULATION):
             new_state = self.electric_heater_on
             if new_state != self._heater_on:
                 self._heater_on = new_state
