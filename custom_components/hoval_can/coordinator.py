@@ -15,12 +15,17 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.storage import Store
 
 from .const import (
     CMD_READ_RESP_BE, CMD_READ_RESP_LE,
     CONF_HEATER_POWER, DEFAULT_HEATER_POWER_KW, DEFAULT_PORT,
     CONF_COOLING_POWER, DEFAULT_COOLING_POWER_W,
-    FRAME_END, FRAME_SEP, FRAME_TIMEOUT, STALE_TIMEOUT,
+    CONF_SOURCE_TEMP, DEFAULT_SOURCE_TEMP_C,
+    CONF_BRINE_PUMP_POWER, DEFAULT_BRINE_PUMP_POWER_W,
+    CONF_HEATING_PUMP_POWER, DEFAULT_HEATING_PUMP_POWER_W,
+    CONF_STANDBY_POWER, DEFAULT_STANDBY_POWER_W,
+    DOMAIN, FRAME_END, FRAME_SEP, FRAME_TIMEOUT, STALE_TIMEOUT,
     DATA_STALE_TIMEOUT, MAX_RX_BUFFER, RX_RESYNC_KEEP,
     RATE_SAMPLE_INTERVAL, THROUGHPUT_WINDOW_S, ERROR_RATE_WINDOW_S,
     RATE_MIN_ELAPSED_S,
@@ -29,9 +34,10 @@ from .const import (
     SCHEDULE_GROUPS, SENSOR_BY_DPID, STRUCT_FMT, TBYTES,
     TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_COUNT,
     DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_STATUS_WW,
-    DP_STATUS_HC, HC_STATUS_PASSIVE_COOLING,
+    DP_STATUS_HC, HC_STATUS_PASSIVE_COOLING, DP_STATUS_HP,
     DP_HEAT_GEN, DP_MODULATION, DHW_STATUS_CHARGING,
     COMPRESSOR_RUNNING_MODULATION,
+    PERSISTENT_DPIDS, PERSIST_SAVE_DELAY_S, STORAGE_VERSION,
     calculate_cop,
     connection_signal, cooling_signal, dp_signal, heater_signal,
 )
@@ -92,6 +98,15 @@ class HovalCANCoordinator:
             maxlen=(THROUGHPUT_WINDOW_S // RATE_SAMPLE_INTERVAL) + 5
         )
         self._rate_unsub = None
+        # ── Coordinator-level persistence (survives HA restarts) ───────────
+        # Seeds self._data with the last-known value of the status/modulation/
+        # temperature datapoints that feed cop / electric_heater_on /
+        # passive_cooling_on / heat_pump_active, so those derived calculations
+        # don't sit blank waiting for CAN to re-broadcast an unchanged value.
+        self._store: Store = Store(
+            hass, STORAGE_VERSION, f"{DOMAIN}_{entry.entry_id}_state"
+        )
+        self._restored_dpids: set[int] = set()
 
     # ── Public properties ─────────────────────────────────────────────────
 
@@ -106,7 +121,97 @@ class HovalCANCoordinator:
         """
         m = float(self._data.get(DP_MODULATION) or 0.0)
         t = float(self._data.get(DP_HEAT_GEN)   or 0.0)
-        return calculate_cop(m, t)
+        return calculate_cop(m, t, self.source_temp_c)
+
+    @property
+    def source_temp_c(self) -> float:
+        """Ground-loop (brine) entering-fluid temperature, °C (options).
+
+        No CAN datapoint reports this on this installation — the Rücklauf/
+        Vorlauf Erdsonde gauges are analog-only. Manual, seasonally-adjusted
+        estimate; feeds the COP lift calculation.
+        """
+        try:
+            return float(
+                self._entry.options.get(CONF_SOURCE_TEMP, DEFAULT_SOURCE_TEMP_C)
+            )
+        except (TypeError, ValueError):
+            return DEFAULT_SOURCE_TEMP_C
+
+    @property
+    def brine_pump_kw(self) -> float:
+        """Ground-loop (brine/source) circulation pump power, kW (options).
+
+        Configured in watts; converted to kW here to compose with the
+        kW-based power/energy maths. Negative/garbage values coerced to 0.
+        """
+        try:
+            watts = float(
+                self._entry.options.get(
+                    CONF_BRINE_PUMP_POWER, DEFAULT_BRINE_PUMP_POWER_W
+                )
+            )
+        except (TypeError, ValueError):
+            watts = DEFAULT_BRINE_PUMP_POWER_W
+        return max(0.0, watts) / 1000.0
+
+    @property
+    def heating_pump_kw(self) -> float:
+        """Heating-circuit circulation pump power, kW (options)."""
+        try:
+            watts = float(
+                self._entry.options.get(
+                    CONF_HEATING_PUMP_POWER, DEFAULT_HEATING_PUMP_POWER_W
+                )
+            )
+        except (TypeError, ValueError):
+            watts = DEFAULT_HEATING_PUMP_POWER_W
+        return max(0.0, watts) / 1000.0
+
+    @property
+    def standby_kw(self) -> float:
+        """Baseline standby power (controller + valve actuator), kW (options).
+
+        Always present whenever the unit is powered — added unconditionally
+        wherever Total Electrical Power/Energy is computed, independent of
+        heat-pump/DHW/cooling state.
+        """
+        try:
+            watts = float(
+                self._entry.options.get(CONF_STANDBY_POWER, DEFAULT_STANDBY_POWER_W)
+            )
+        except (TypeError, ValueError):
+            watts = DEFAULT_STANDBY_POWER_W
+        return max(0.0, watts) / 1000.0
+
+    @property
+    def heat_pump_active(self) -> bool | None:
+        """True when the compressor is drawing (modulation above the
+        "running" threshold). None until DpId 20052 has been seen even once —
+        distinct from "known off", so callers don't silently coerce an unseen
+        state into 0."""
+        m = self._data.get(DP_MODULATION)
+        if m is None:
+            return None
+        return float(m) > COMPRESSOR_RUNNING_MODULATION
+
+    @property
+    def pumps_active(self) -> bool | None:
+        """True whenever the brine and heating-circuit pumps should be
+        running: the compressor is active (heating/DHW) OR the heating
+        circuit is in passive/free cooling. Both draw the ground-loop and
+        heating-circuit pumps even though the compressor itself is idle
+        during passive cooling — additive, not overlapping, with the
+        COP-based heat-pump electrical term.
+
+        None only when neither input has been seen yet, so an installation
+        that hasn't reported either datapoint doesn't get coerced to "off".
+        """
+        hp = self.heat_pump_active
+        cool = self.passive_cooling_on
+        if hp is None and cool is None:
+            return None
+        return bool(hp) or bool(cool)
 
     @property
     def heater_power_kw(self) -> float:
@@ -224,11 +329,17 @@ class HovalCANCoordinator:
             "options": {
                 "heater_power_kw": self.heater_power_kw,
                 "cooling_power_w": round(self.cooling_power_kw * 1000.0, 1),
+                "source_temp_c": self.source_temp_c,
+                "brine_pump_power_w": round(self.brine_pump_kw * 1000.0, 1),
+                "heating_pump_power_w": round(self.heating_pump_kw * 1000.0, 1),
+                "standby_power_w": round(self.standby_kw * 1000.0, 1),
             },
             "derived": {
                 "cop": self.cop,
                 "electric_heater_on": self.electric_heater_on,
                 "passive_cooling_on": self.passive_cooling_on,
+                "heat_pump_active": self.heat_pump_active,
+                "pumps_active": self.pumps_active,
             },
             "datapoints_seen": len(self._data),
             "last_values": named,
@@ -295,8 +406,76 @@ class HovalCANCoordinator:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
+    async def _async_load_persisted(self) -> None:
+        """Seed self._data from HA's Store, before any CAN frame has arrived.
+
+        Runs during async_start(), which is awaited before the sensor
+        platform is set up (see __init__.py), so by the time entities
+        subscribe to dispatcher signals the coordinator already has last-known
+        values ready to replay via async_replay_restored_signals(). A corrupt
+        or missing store must never block startup — worst case is a cold
+        start identical to today's behaviour.
+        """
+        try:
+            stored = await self._store.async_load()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "Hoval CAN: could not load persisted state (%s) — starting cold",
+                err,
+            )
+            return
+        if not isinstance(stored, dict):
+            return
+        for key, value in stored.items():
+            try:
+                dp_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            if dp_id not in PERSISTENT_DPIDS or value is None:
+                continue
+            self._data[dp_id] = value
+            self._restored_dpids.add(dp_id)
+        if self._restored_dpids:
+            _LOGGER.debug(
+                "Hoval CAN: restored %d persisted datapoint(s) from storage",
+                len(self._restored_dpids),
+            )
+            # Seed the edge-detected derived states too, so the first real
+            # CAN update doesn't spuriously look like a transition.
+            self._heater_on  = self.electric_heater_on
+            self._cooling_on = self.passive_cooling_on
+
+    def async_replay_restored_signals(self) -> None:
+        """Fire dispatcher signals for datapoints seeded from storage.
+
+        Call once from __init__.py, AFTER the sensor platform has been set up
+        (entities are subscribed by then) but using values that were already
+        loaded earlier in async_start(). This is what actually makes restored
+        data show up immediately after a restart instead of waiting for the
+        next CAN broadcast of an unchanged value.
+        """
+        for dp_id in self._restored_dpids:
+            async_dispatcher_send(self.hass, dp_signal(self._entry.entry_id, dp_id))
+        if self._restored_dpids & {
+            DP_STATUS_WW, DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_HEAT_GEN, DP_MODULATION,
+        }:
+            async_dispatcher_send(self.hass, heater_signal(self._entry.entry_id))
+        if DP_STATUS_HC in self._restored_dpids or DP_STATUS_HP in self._restored_dpids:
+            async_dispatcher_send(self.hass, cooling_signal(self._entry.entry_id))
+
+    def _persist_snapshot(self) -> dict[str, Any]:
+        return {
+            str(dp_id): self._data[dp_id]
+            for dp_id in PERSISTENT_DPIDS
+            if dp_id in self._data
+        }
+
+    def _schedule_persist(self) -> None:
+        self._store.async_delay_save(self._persist_snapshot, PERSIST_SAVE_DELAY_S)
+
     async def async_start(self) -> None:
         self._stop = False
+        await self._async_load_persisted()
         # Use the config-entry's tracked background-task helper where available
         # (HA 2023.4+) so the task is owned by the entry and is reliably
         # cancelled on unload / HA shutdown. Fall back to a raw loop task on
@@ -562,6 +741,13 @@ class HovalCANCoordinator:
         self._last_data_mono = time.monotonic()   # feeds the data watchdog
         self._decoded_count += 1
         async_dispatcher_send(self.hass, dp_signal(self._entry.entry_id, dp_id))
+
+        if dp_id in PERSISTENT_DPIDS:
+            # Live data always takes precedence over anything restored; a
+            # fresh value here simply overwrites the seeded one in self._data
+            # (already done above) and refreshes what gets persisted next.
+            self._restored_dpids.discard(dp_id)
+            self._schedule_persist()
 
         if dp_id in (DP_STATUS_WW, DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_HEAT_GEN,
                      DP_MODULATION):

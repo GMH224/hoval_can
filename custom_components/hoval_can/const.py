@@ -56,10 +56,51 @@ HEATER_POWER_MAX      = 12.0           # kW  (dual-element upper bound)
 # Passive ("free"/natural) cooling: the compressor is OFF and only the
 # circulation pump(s) run, so the draw is small and roughly constant. Configured
 # in WATTS (not kW) to match the small magnitudes involved.
+# NOTE: superseded as a Total Electrical Power/Energy input by the more
+# granular CONF_BRINE_PUMP_POWER + CONF_HEATING_PUMP_POWER below (same
+# physical pumps, modelled per-component instead of as one lump estimate).
+# Kept configurable and still displayed on its own entity so existing history
+# is not lost; see HovalPassiveCoolingPowerSensor.
 CONF_COOLING_POWER       = "cooling_power_w"
 DEFAULT_COOLING_POWER_W: float = 100.0  # W — typical circulation-pump draw
 COOLING_POWER_MIN        = 0.0          # W
 COOLING_POWER_MAX        = 500.0        # W
+
+# Ground-source heat-source ("brine"/Sole) loop temperature. No CAN datapoint
+# reports this — the Rücklauf/Vorlauf Erdsonde gauges on this installation are
+# analog-only. Manual, seasonally-adjusted estimate; feeds the COP lift calc.
+CONF_SOURCE_TEMP             = "source_temp_c"
+DEFAULT_SOURCE_TEMP_C: float = 12.5     # °C
+SOURCE_TEMP_MIN              = -5.0     # °C
+SOURCE_TEMP_MAX              = 25.0     # °C
+
+# Ground-loop (brine/source) circulation pump. Per Hoval's own spec sheet this
+# is "je eine drehzahlregulierte Hocheffizienzpumpe heizungs- bzw. soleseitig"
+# — i.e. the SAME class of speed-regulated high-efficiency circulator as the
+# heating-circuit pump, not a separate high-draw unit. Default set close to
+# the heating pump's own default as a result; treat as an estimate until
+# measured/confirmed against the actual brine-pump nameplate.
+CONF_BRINE_PUMP_POWER             = "brine_pump_power_w"
+DEFAULT_BRINE_PUMP_POWER_W: float = 30.0   # W
+BRINE_PUMP_POWER_MIN              = 0.0    # W
+BRINE_PUMP_POWER_MAX              = 200.0  # W
+
+# Heating-circuit circulation pump. Nameplate (Hoval-branded, Imax 0.44 A,
+# 4-40 W dynamic/electronic regulation range) — default is the median of that
+# range.
+CONF_HEATING_PUMP_POWER             = "heating_pump_power_w"
+DEFAULT_HEATING_PUMP_POWER_W: float = 20.0  # W
+HEATING_PUMP_POWER_MIN              = 0.0   # W
+HEATING_PUMP_POWER_MAX              = 100.0 # W
+
+# Baseline standby draw: TopTronic E controller electronics, idle sensors, and
+# the Siemens GLB341.9E 3-way valve actuator (nameplate: 1.9 W / 5.8 VA).
+# Always present whenever the unit is powered, independent of heat-pump/DHW/
+# cooling state.
+CONF_STANDBY_POWER             = "standby_power_w"
+DEFAULT_STANDBY_POWER_W: float = 12.0  # W
+STANDBY_POWER_MIN              = 0.0   # W
+STANDBY_POWER_MAX              = 100.0 # W
 
 # ── CAN-BUS protocol ──────────────────────────────────────────────────────
 FRAME_SEP = b"\xff\x01"
@@ -109,6 +150,7 @@ DP_DHW_ACTUAL      = 4       # Warmwasser-Ist        S16 dec=1 °C
 DP_DHW_SETPOINT    = 1004    # Warmwasser-Soll       S16 dec=1 °C
 DP_STATUS_WW       = 2052    # Status WW             U8  (8 = charging)
 DP_STATUS_HC       = 2051    # Heating Circuit Status U8 (9 = passive cooling)
+DP_STATUS_HP       = 2053    # Heat Pump Status        U8
 DP_HEAT_GEN        = 7       # Wärmeerzeuger-Ist     S16 dec=1 °C  ← COP input
 DP_THERMAL_POWER   = 29051   # Current Heating Power U32 dec=1 kW
 DP_MODULATION      = 20052   # Compressor Modulation U8  %         ← COP input
@@ -141,7 +183,11 @@ COP_CLAMP_MIN: float    = 1.0
 COP_CLAMP_MAX: float    = 8.5
 
 
-def calculate_cop(modulation: float, heat_gen_temp: float) -> float:
+def calculate_cop(
+    modulation: float,
+    heat_gen_temp: float,
+    source_temp: float = COP_SOURCE_TEMP,
+) -> float:
     """Dynamic COP from compressor modulation and heat generator temperature.
 
     Two-regime piecewise model calibrated against real operating data.
@@ -159,14 +205,18 @@ def calculate_cop(modulation: float, heat_gen_temp: float) -> float:
                  = 3.500 − 0.0100×m  if m > 60
         COP = cop_base × (39.5 / lift)
 
+    ``source_temp`` defaults to COP_SOURCE_TEMP but is normally passed in from
+    the coordinator's configurable, seasonally-adjustable option (there is no
+    CAN datapoint for ground-loop temperature on this installation).
+
     Returns 0.0 when the heat pump is not running (m ≤ 1) or during a
     cold start where T_gen has not yet risen above the source temperature.
     Final result clamped to [COP_CLAMP_MIN, COP_CLAMP_MAX].
     """
-    if modulation <= 1.0 or heat_gen_temp <= COP_SOURCE_TEMP:
+    if modulation <= 1.0 or heat_gen_temp <= source_temp:
         return 0.0
 
-    lift = heat_gen_temp - COP_SOURCE_TEMP
+    lift = heat_gen_temp - source_temp
 
     if heat_gen_temp <= COP_SH_MAX_TGEN:
         # ── Space heating regime ──────────────────────────────────────────
@@ -334,4 +384,29 @@ SENSOR_BY_DPID: dict[int, HovalSensorDescription] = {
     s.dp_id: s for s in SENSOR_DESCRIPTIONS
 }
 
-PERSISTENT_DPIDS: frozenset[int] = frozenset({23009})
+# DpIds whose last-known value survives a Home Assistant restart.
+#
+# 23009 is the hardware lifetime-energy counter (entity-level restore only,
+# pre-existing). The rest feed the derived power/COP calculations
+# (HovalCANCoordinator.cop / electric_heater_on / passive_cooling_on /
+# heat_pump_active); persisting them closes the gap where CAN only
+# broadcasts a datapoint on change, so a value that hasn't changed since
+# before the restart might otherwise not arrive again for a long time,
+# leaving Total Electrical Power sitting at Unknown. Used both for each raw
+# sensor's own entity-level restore (HovalPersistentSensor) and, in the
+# coordinator, to seed internal state from HA's Store before any CAN data
+# has arrived — see HovalCANCoordinator._async_load_persisted().
+PERSISTENT_DPIDS: frozenset[int] = frozenset({
+    23009,
+    DP_STATUS_HP, DP_STATUS_HC, DP_STATUS_WW,
+    DP_MODULATION, DP_HEAT_GEN, DP_THERMAL_POWER,
+    DP_DHW_ACTUAL, DP_DHW_SETPOINT,
+})
+
+# ── Coordinator-level persistent storage (HA Store helper) ─────────────────
+STORAGE_VERSION = 1
+# Debounce window for writing PERSISTENT_DPIDS to disk: CAN can broadcast a
+# changing datapoint every ~2 s, so every update would otherwise hit flash
+# storage constantly. Store.async_delay_save coalesces repeated calls within
+# this window into a single write, and still flushes on HA shutdown.
+PERSIST_SAVE_DELAY_S = 30

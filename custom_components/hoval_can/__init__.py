@@ -19,6 +19,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await coordinator.async_start()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # Entities are now subscribed to dispatcher signals — replay any state
+    # restored from storage in coordinator.async_start() so it shows up
+    # immediately instead of waiting for the next CAN broadcast.
+    coordinator.async_replay_restored_signals()
     # Reload on options change (e.g. new heater power) — RestoreEntity
     # preserves all accumulated energy totals across the reload.
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))

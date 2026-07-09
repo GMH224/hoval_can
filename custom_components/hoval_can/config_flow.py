@@ -17,6 +17,14 @@ from .const import (
     CONF_HEATER_POWER, DEFAULT_HEATER_POWER_KW,
     CONF_COOLING_POWER, DEFAULT_COOLING_POWER_W,
     COOLING_POWER_MAX, COOLING_POWER_MIN,
+    CONF_SOURCE_TEMP, DEFAULT_SOURCE_TEMP_C,
+    SOURCE_TEMP_MAX, SOURCE_TEMP_MIN,
+    CONF_BRINE_PUMP_POWER, DEFAULT_BRINE_PUMP_POWER_W,
+    BRINE_PUMP_POWER_MAX, BRINE_PUMP_POWER_MIN,
+    CONF_HEATING_PUMP_POWER, DEFAULT_HEATING_PUMP_POWER_W,
+    HEATING_PUMP_POWER_MAX, HEATING_PUMP_POWER_MIN,
+    CONF_STANDBY_POWER, DEFAULT_STANDBY_POWER_W,
+    STANDBY_POWER_MAX, STANDBY_POWER_MIN,
     DEFAULT_PORT, DOMAIN,
     HEATER_POWER_MAX, HEATER_POWER_MIN,
 )
@@ -77,10 +85,13 @@ class HovalCANConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class HovalCANOptionsFlow(OptionsFlow):
-    """Options: electric heater rated power and passive-cooling pump power.
+    """Options: electric heater rated power, passive-cooling pump power,
+    ground-loop source temperature, brine/heating pump power, and standby
+    power.
 
-    COP is calculated automatically from live sensor data and does not
-    appear here.
+    COP is calculated automatically from live sensor data — only the source
+    (ground-loop) temperature it needs is configurable here, since no CAN
+    datapoint reports it on this installation.
     """
 
     def __init__(self, config_entry: ConfigEntry) -> None:
@@ -99,8 +110,20 @@ class HovalCANOptionsFlow(OptionsFlow):
         current_cooling = float(
             opts.get(CONF_COOLING_POWER, DEFAULT_COOLING_POWER_W)
         )
-        # Both fields are present in the schema so that saving one does not
-        # drop the other (async_create_entry replaces the whole options dict).
+        current_source_temp = float(
+            opts.get(CONF_SOURCE_TEMP, DEFAULT_SOURCE_TEMP_C)
+        )
+        current_brine_pump = float(
+            opts.get(CONF_BRINE_PUMP_POWER, DEFAULT_BRINE_PUMP_POWER_W)
+        )
+        current_heating_pump = float(
+            opts.get(CONF_HEATING_PUMP_POWER, DEFAULT_HEATING_PUMP_POWER_W)
+        )
+        current_standby = float(
+            opts.get(CONF_STANDBY_POWER, DEFAULT_STANDBY_POWER_W)
+        )
+        # All fields are present in the schema so that saving one does not
+        # drop the others (async_create_entry replaces the whole options dict).
         schema = vol.Schema({
             vol.Required(CONF_HEATER_POWER, default=current_heater): vol.All(
                 vol.Coerce(float),
@@ -109,6 +132,24 @@ class HovalCANOptionsFlow(OptionsFlow):
             vol.Required(CONF_COOLING_POWER, default=current_cooling): vol.All(
                 vol.Coerce(float),
                 vol.Range(min=COOLING_POWER_MIN, max=COOLING_POWER_MAX),
+            ),
+            vol.Required(CONF_SOURCE_TEMP, default=current_source_temp): vol.All(
+                vol.Coerce(float),
+                vol.Range(min=SOURCE_TEMP_MIN, max=SOURCE_TEMP_MAX),
+            ),
+            vol.Required(CONF_BRINE_PUMP_POWER, default=current_brine_pump): vol.All(
+                vol.Coerce(float),
+                vol.Range(min=BRINE_PUMP_POWER_MIN, max=BRINE_PUMP_POWER_MAX),
+            ),
+            vol.Required(
+                CONF_HEATING_PUMP_POWER, default=current_heating_pump
+            ): vol.All(
+                vol.Coerce(float),
+                vol.Range(min=HEATING_PUMP_POWER_MIN, max=HEATING_PUMP_POWER_MAX),
+            ),
+            vol.Required(CONF_STANDBY_POWER, default=current_standby): vol.All(
+                vol.Coerce(float),
+                vol.Range(min=STANDBY_POWER_MIN, max=STANDBY_POWER_MAX),
             ),
         })
         return self.async_show_form(step_id="init", data_schema=schema)

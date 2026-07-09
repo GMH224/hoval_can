@@ -97,6 +97,30 @@ _mod("homeassistant.helpers.event",
 _mod("homeassistant.helpers.restore_state",
      RestoreEntity=type("RestoreEntity", (), {}))
 
+
+# Minimal functional Store stub: real in-memory round-trip (keyed by the
+# storage key, like the real disk-backed Store keyed by filename), so
+# persistence logic can be exercised without touching a filesystem.
+class _FakeStore:
+    _backing: dict = {}
+
+    def __init__(self, hass, version, key):
+        self._key = key
+
+    async def async_load(self):
+        return _FakeStore._backing.get(self._key)
+
+    async def async_save(self, data):
+        _FakeStore._backing[self._key] = data
+
+    def async_delay_save(self, data_func, delay=0):
+        # Synchronous stand-in for the real debounced write — good enough to
+        # verify the data that WOULD be persisted.
+        _FakeStore._backing[self._key] = data_func()
+
+
+_mod("homeassistant.helpers.storage", Store=_FakeStore, _FakeStore=_FakeStore)
+
 # ── Import the component under test ─────────────────────────────────────────
 sys.path.insert(0, os.path.join(
     os.path.dirname(__file__), "..", "custom_components"))
@@ -345,6 +369,10 @@ def test_cooling_sensors():
             self.connected = True
             self.heater_power_kw = 3.0
             self.cooling_power_kw = 0.1
+            self.brine_pump_kw = 0.03
+            self.heating_pump_kw = 0.02
+            self.standby_kw = 0.012
+            self.pumps_active = None
             self._cop = 0.0
             self.thermal = None
             self.heater = None
@@ -374,27 +402,32 @@ def test_cooling_sensors():
         return obj._attr_native_value
 
     fc = FakeCoord()
-    # No data yet -> Unknown (unchanged availability rule)
-    fc.thermal, fc.heater, fc.cooling = None, None, None
-    expect("totals Unknown when thermal/heater unknown", total_power(fc) is None)
+    # No CAN data at all yet: per the sensor's own documented behaviour every
+    # unknown input except standby is zero-filled (not blanked to Unknown) —
+    # this was already the pre-existing, intentional design (confirmed
+    # against the original codebase; the old assertion here predating this
+    # change simply didn't match it). Standby is unconditional, so the floor
+    # is the standby draw, never an outright Unknown.
+    fc.thermal, fc.heater = None, None
+    approx("no CAN data yet -> standby-only floor", total_power(fc), 0.012)
 
-    # Cooling status still unknown but thermal+heater known -> NO regression,
-    # cooling treated as 0.
-    fc.thermal, fc.heater, fc.cooling, fc._cop = 0.0, False, None, 0.0
-    approx("cooling None -> 0 contribution", total_power(fc), 0.0)
+    # thermal+heater known, pumps_active still unknown -> zero-filled, but
+    # standby is unconditional, so the total is never simply "nothing".
+    fc.thermal, fc.heater, fc._cop, fc.pumps_active = 0.0, False, 0.0, None
+    approx("standby-only baseline (pumps unknown)", total_power(fc), 0.012)
 
-    # Passive cooling active: +0.1 kW
-    fc.cooling = True
-    approx("cooling on adds 0.1 kW", total_power(fc), 0.1)
+    # Pumps active (heating OR passive cooling): + brine + heating pump
+    fc.pumps_active = True
+    approx("pumps add brine+heating+standby", total_power(fc), 0.03 + 0.02 + 0.012)
 
-    # Cooling on + heater on + heat pump running
-    fc.thermal, fc._cop, fc.heater, fc.cooling = 6.0, 3.0, True, True
-    # hp = 6/3 = 2.0, heater 3.0, cooling 0.1 -> 5.1
-    approx("combined hp+heater+cooling", total_power(fc), 5.1)
+    # Pumps active + heater on + heat pump running
+    fc.thermal, fc._cop, fc.heater, fc.pumps_active = 6.0, 3.0, True, True
+    # hp = 6/3 = 2.0, heater 3.0, pumps 0.05, standby 0.012 -> 5.062
+    approx("combined hp+heater+pumps+standby", total_power(fc), 5.062)
 
-    # Cooling off -> term drops
-    fc.cooling = False
-    approx("cooling off -> no cooling term", total_power(fc), 5.0)
+    # Pumps inactive -> pump terms drop, standby remains
+    fc.pumps_active = False
+    approx("pumps off -> hp+heater+standby only", total_power(fc), 5.012)
 
     # Passive Cooling Power sensor
     pc = object.__new__(S.HovalPassiveCoolingPowerSensor)
@@ -428,6 +461,136 @@ def test_cooling_sensors():
     te._last_ts = 1000.0
     te._integrate(1000.0 + 3600.0, 0.1)
     approx("Total energy 1h@100W cooling -> 0.1 kWh", te._total_kwh, 0.1)
+
+
+def test_power_model_options():
+    print("== new power-model options (source temp / brine / heating pump / standby) ==")
+    MOD, HC = const.DP_MODULATION, const.DP_STATUS_HC
+
+    # source_temp_c: default, override, garbage
+    co = _co_with_options({})
+    approx("default source_temp_c 12.5", co.source_temp_c, 12.5)
+    co = _co_with_options({const.CONF_SOURCE_TEMP: 9.0})
+    approx("override source_temp_c 9.0", co.source_temp_c, 9.0)
+    co = _co_with_options({const.CONF_SOURCE_TEMP: "bad"})
+    approx("garbage source_temp_c -> default", co.source_temp_c, 12.5)
+
+    # calculate_cop honours the passed-in source_temp (colder loop -> bigger
+    # lift -> lower COP for the same modulation/T_gen than the 12.5 default)
+    cop = const.calculate_cop
+    hot_default = cop(15, 30.0)             # default source_temp=12.5, lift=17.5
+    colder_loop = cop(15, 30.0, 9.0)        # source_temp=9.0, lift=21.0
+    expect("colder source -> lower COP for same lift-independent inputs",
+           colder_loop < hot_default)
+
+    # brine_pump_kw / heating_pump_kw / standby_kw: default, override,
+    # garbage, negative -> all clamp to >= 0
+    co = _co_with_options({})
+    approx("default brine_pump_kw 0.03", co.brine_pump_kw, 0.03)
+    approx("default heating_pump_kw 0.02", co.heating_pump_kw, 0.02)
+    approx("default standby_kw 0.012", co.standby_kw, 0.012)
+    co = _co_with_options({const.CONF_BRINE_PUMP_POWER: 45})
+    approx("override brine_pump_kw", co.brine_pump_kw, 0.045)
+    co = _co_with_options({const.CONF_HEATING_PUMP_POWER: -10})
+    approx("negative heating_pump_kw -> 0", co.heating_pump_kw, 0.0)
+    co = _co_with_options({const.CONF_STANDBY_POWER: "bad"})
+    approx("garbage standby_kw -> default", co.standby_kw, 0.012)
+
+    # heat_pump_active: None until modulation seen, then threshold-gated
+    co = _co()
+    expect("heat_pump_active unknown -> None", co.heat_pump_active is None)
+    co._update_dp(MOD, 0)
+    expect("modulation 0 -> not active", co.heat_pump_active is False)
+    co._update_dp(MOD, 25)
+    expect("modulation 25 -> active", co.heat_pump_active is True)
+
+    # pumps_active: OR of heat_pump_active and passive_cooling_on; None only
+    # when BOTH are unknown
+    co = _co()
+    expect("pumps_active unknown when neither input seen", co.pumps_active is None)
+    co._update_dp(HC, 1)   # heating-circuit status known, not cooling
+    expect("pumps_active False when HC known-off and HP still unknown",
+           co.pumps_active is False)
+    co._update_dp(MOD, 30)
+    expect("pumps_active True once compressor active", co.pumps_active is True)
+    co._update_dp(MOD, 0)
+    co._update_dp(HC, 9)   # passive cooling
+    expect("pumps_active True during passive cooling even with compressor off",
+           co.pumps_active is True)
+
+
+def test_persistence():
+    print("== coordinator-level persistence (Store round-trip) ==")
+    from homeassistant.helpers.storage import _FakeStore
+    _FakeStore._backing.clear()
+    MOD, HG, HC = const.DP_MODULATION, const.DP_HEAT_GEN, const.DP_STATUS_HC
+
+    entry = types.SimpleNamespace(
+        entry_id="persist1", data={"host": "h", "port": 3113}, options={},
+    )
+    hass = types.SimpleNamespace(loop=None)
+
+    # First "run": receive some persistent datapoints, they get scheduled for
+    # save via the (synchronous, in the stub) async_delay_save.
+    co1 = C.HovalCANCoordinator(hass, entry)
+    co1._update_dp(MOD, 27)
+    co1._update_dp(HG, 34.0)
+    co1._update_dp(HC, 9)
+    saved = _FakeStore._backing.get(f"{const.DOMAIN}_persist1_state")
+    expect("snapshot was persisted", saved is not None)
+    expect("persisted snapshot includes modulation",
+           saved is not None and str(MOD) in saved and saved[str(MOD)] == 27)
+
+    # Non-persistent dpid must NOT be written to the snapshot.
+    co1._update_dp(0, 5.0)   # outdoor_temp — not in PERSISTENT_DPIDS
+    saved2 = _FakeStore._backing.get(f"{const.DOMAIN}_persist1_state")
+    expect("non-persistent dpid excluded from snapshot",
+           saved2 is not None and str(0) not in saved2)
+
+    # "Restart": a fresh coordinator instance backed by the same store loads
+    # the last-known values before any CAN frame has arrived.
+    co2 = C.HovalCANCoordinator(hass, entry)
+    asyncio.run(co2._async_load_persisted())
+    expect("restored modulation available before any live frame",
+           co2.get_value(MOD) == 27)
+    expect("restored heat_gen_temp available before any live frame",
+           co2.get_value(HG) == 34.0)
+    expect("derived pumps_active correct from restored data alone",
+           co2.pumps_active is True)   # HC status 9 was restored
+
+    # Replaying signals should fire dp_signal for each restored dpid plus the
+    # heater/cooling composite signals, so already-subscribed entities update.
+    from homeassistant.helpers import dispatcher as D
+    D._SENT.clear()
+    co2.async_replay_restored_signals()
+    expect("replay fires dp_signal for restored modulation",
+           const.dp_signal("persist1", MOD) in D._SENT)
+    expect("replay fires cooling_signal (HC status was restored)",
+           const.cooling_signal("persist1") in D._SENT)
+
+    # Fresh live data always overwrites a restored value, and is no longer
+    # tracked as "restored" afterwards.
+    co2._update_dp(MOD, 5)
+    expect("live update overwrites restored value", co2.get_value(MOD) == 5)
+    expect("dpid no longer marked as restored after a live update",
+           MOD not in co2._restored_dpids)
+
+    # A corrupt/missing store must never block startup.
+    class _BrokenStore:
+        def __init__(self, *a, **k):
+            pass
+
+        async def async_load(self):
+            raise RuntimeError("disk error")
+
+    real_store_cls = C.Store
+    try:
+        C.Store = _BrokenStore
+        co3 = C.HovalCANCoordinator(hass, entry)
+        asyncio.run(co3._async_load_persisted())
+        expect("broken store does not raise / starts cold", co3.get_value(MOD) is None)
+    finally:
+        C.Store = real_store_cls
 
 
 def test_diagnostics():
@@ -602,6 +765,8 @@ def main():
     test_integrator_math()
     test_cooling_coordinator()
     test_cooling_sensors()
+    test_power_model_options()
+    test_persistence()
     test_diagnostics()
     test_rates()
     print()

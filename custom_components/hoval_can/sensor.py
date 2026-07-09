@@ -48,6 +48,9 @@ async def async_setup_entry(
         HovalPassiveCoolingEnergySensor(coord, entry),
         HovalHeatPumpElecPowerSensor(coord, entry),
         HovalHeatPumpElecEnergySensor(coord, entry),
+        HovalBrinePumpPowerSensor(coord, entry),
+        HovalHeatingPumpPowerSensor(coord, entry),
+        HovalStandbyPowerSensor(coord, entry),
         HovalTotalElecPowerSensor(coord, entry),
         HovalTotalElecEnergySensor(coord, entry),
         # Diagnostic telemetry (promoted from connectivity-sensor attributes
@@ -336,7 +339,14 @@ class HovalPassiveCoolingPowerSensor(HovalBaseEntity):
 
     Returns cooling_power_kw (configurable, default 0.1 kW = 100 W) when the
     heating circuit reports passive-cooling mode (status 9), 0.0 otherwise.
-    Unknown until the Heating Circuit Status datapoint is first received."""
+    Unknown until the Heating Circuit Status datapoint is first received.
+
+    NOTE: no longer part of Total Electrical Power/Energy — superseded by
+    HovalBrinePumpPowerSensor + HovalHeatingPumpPowerSensor, which model the
+    same physical pumps per-component (and share the same trigger with active
+    heating/DHW, instead of a separate cooling-only estimate). Kept as its own
+    entity purely so existing history on it isn't lost.
+    """
     _attr_device_class               = SensorDeviceClass.POWER
     _attr_state_class                = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = "kW"
@@ -378,7 +388,10 @@ class HovalPassiveCoolingEnergySensor(HovalBaseEntity, RestoreEntity):
     Power = coordinator.cooling_power_kw (configurable, default 0.1 kW).
     Mirrors the electric-heater energy sensor exactly: monotonic-clock
     integration, open interval discarded on disconnect, restores across
-    restarts, only ever increases, 3-decimal precision."""
+    restarts, only ever increases, 3-decimal precision.
+
+    NOTE: no longer part of Total Electrical Energy — see
+    HovalPassiveCoolingPowerSensor for why. Kept for its own history."""
     _attr_device_class               = SensorDeviceClass.ENERGY
     _attr_state_class                = SensorStateClass.TOTAL_INCREASING
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
@@ -604,13 +617,125 @@ class HovalHeatPumpElecEnergySensor(HovalBaseEntity, RestoreEntity):
         self.async_write_ha_state()
 
 
+# ── Brine/source pump: power ────────────────────────────────────────────────
+
+class HovalBrinePumpPowerSensor(HovalBaseEntity):
+    """Instantaneous power of the ground-loop (brine/source) circulation pump.
+
+    Returns brine_pump_power_w (configurable, default 30 W) whenever
+    coordinator.pumps_active is True — i.e. the compressor is active
+    (heating/DHW) or the heating circuit is in passive/free cooling, since
+    both draw the ground loop. 0.0 when known-inactive; Unknown until enough
+    data has been seen to tell either way."""
+    _attr_device_class               = SensorDeviceClass.POWER
+    _attr_state_class                = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "kW"
+    _attr_icon                       = "mdi:pump"
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id    = f"{entry.entry_id}_brine_pump_power"
+        self._attr_name         = "Brine Pump Power"
+        self._attr_native_value = None
+        self._has_value         = False
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        for sig in (
+            dp_signal(self._entry.entry_id, DP_MODULATION),
+            cooling_signal(self._entry.entry_id),
+        ):
+            self.async_on_remove(
+                async_dispatcher_connect(self.hass, sig, self._update)
+            )
+
+    @callback
+    def _update(self) -> None:
+        active = self._coord.pumps_active
+        if active is None and not self._has_value:
+            return
+        if active is not None:
+            self._has_value = True
+            self._attr_native_value = (
+                round(self._coord.brine_pump_kw, 3) if active else 0.0
+            )
+        self.async_write_ha_state()
+
+
+# ── Heating-circuit pump: power ─────────────────────────────────────────────
+
+class HovalHeatingPumpPowerSensor(HovalBaseEntity):
+    """Instantaneous power of the heating-circuit circulation pump.
+
+    Same trigger as the brine pump (coordinator.pumps_active): the pump runs
+    during active heating/DHW and during passive cooling. Returns
+    heating_pump_power_w (configurable, default 20 W — the median of the
+    pump's own 4-40 W nameplate range)."""
+    _attr_device_class               = SensorDeviceClass.POWER
+    _attr_state_class                = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "kW"
+    _attr_icon                       = "mdi:pump"
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id    = f"{entry.entry_id}_heating_pump_power"
+        self._attr_name         = "Heating Pump Power"
+        self._attr_native_value = None
+        self._has_value         = False
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        for sig in (
+            dp_signal(self._entry.entry_id, DP_MODULATION),
+            cooling_signal(self._entry.entry_id),
+        ):
+            self.async_on_remove(
+                async_dispatcher_connect(self.hass, sig, self._update)
+            )
+
+    @callback
+    def _update(self) -> None:
+        active = self._coord.pumps_active
+        if active is None and not self._has_value:
+            return
+        if active is not None:
+            self._has_value = True
+            self._attr_native_value = (
+                round(self._coord.heating_pump_kw, 3) if active else 0.0
+            )
+        self.async_write_ha_state()
+
+
+# ── Standby: power ──────────────────────────────────────────────────────────
+
+class HovalStandbyPowerSensor(HovalBaseEntity):
+    """Baseline standby power (TopTronic E controller electronics + Siemens
+    GLB341.9E valve actuator idle draw). Configurable (standby_power_w,
+    default 12 W). Always present whenever the unit is powered — independent
+    of heat-pump/DHW/cooling state, so this never reports Unknown while the
+    gateway connection is up."""
+    _attr_device_class               = SensorDeviceClass.POWER
+    _attr_state_class                = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "kW"
+    _attr_icon                       = "mdi:power-standby"
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id    = f"{entry.entry_id}_standby_power"
+        self._attr_name         = "Standby Power"
+        self._attr_native_value = round(coord.standby_kw, 3)
+
+
 # ── Total electrical: power ────────────────────────────────────────────────
 
 class HovalTotalElecPowerSensor(HovalBaseEntity):
-    """Total instantaneous electrical power: heat pump + electric heater +
-    passive cooling. Unknown inputs are treated as 0 (see `_update`), so the
-    total reports known loads even before every datapoint has been broadcast;
-    a dead/stalled link is surfaced via `available`. 3-decimal precision."""
+    """Total instantaneous electrical power: heat pump (compressor, via
+    measured thermal power / dynamic COP) + electric heater + brine pump +
+    heating-circuit pump + standby. Unknown inputs are treated as 0 (see
+    `_update`), so the total reports known loads even before every datapoint
+    has been broadcast; a dead/stalled link is surfaced via `available`.
+    Standby is unconditional, so this is never 0 due to "nothing running" —
+    only Unknown/Unavailable can do that. 3-decimal precision."""
     _attr_device_class               = SensorDeviceClass.POWER
     _attr_state_class                = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = "kW"
@@ -649,25 +774,30 @@ class HovalTotalElecPowerSensor(HovalBaseEntity):
         cop       = self._coord.cop
         hp_elec   = (0.0 if (thermal is None or thermal == 0.0 or cop == 0.0)
                      else thermal / cop)
-        heater_elec  = self._coord.heater_power_kw if heater_on else 0.0
-        cooling_elec = (self._coord.cooling_power_kw
-                        if self._coord.passive_cooling_on else 0.0)
-        self._attr_native_value = round(hp_elec + heater_elec + cooling_elec, 3)
+        heater_elec = self._coord.heater_power_kw if heater_on else 0.0
+        pumps_on    = bool(self._coord.pumps_active)  # None -> False (zero-fill)
+        brine_elec   = self._coord.brine_pump_kw if pumps_on else 0.0
+        heating_elec = self._coord.heating_pump_kw if pumps_on else 0.0
+        standby_elec = self._coord.standby_kw  # always on, never zero-filled
+        self._attr_native_value = round(
+            hp_elec + heater_elec + brine_elec + heating_elec + standby_elec, 3
+        )
         self.async_write_ha_state()
 
 
 # ── Total electrical: energy ───────────────────────────────────────────────
 
 class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
-    """Total cumulative electrical energy: heat pump + electric heater +
-    passive cooling (kWh).
+    """Total cumulative electrical energy: heat pump (compressor) + electric
+    heater + brine pump + heating-circuit pump + standby (kWh).
 
     Independent persistent counter — not a runtime sum of sub-sensors.
-    Integrates on every DpId=29051 update and heater state change.
-    60-second timer keeps value current between infrequent heater events.
-    Unknown inputs are treated as 0 (see Total Electrical Power), so cooling
-    energy keeps integrating through passive-cooling spells even before
-    status_dhw has been broadcast; the integrator only pauses on disconnect.
+    Integrates on every DpId=29051 update, heater state change, and pump
+    state change. 60-second timer keeps value current between infrequent
+    events. Unknown inputs are treated as 0 (see Total Electrical Power), so
+    pump energy keeps integrating through passive-cooling spells even before
+    status_dhw has been broadcast; standby is never zero-filled. The
+    integrator only pauses on disconnect.
     • Starts at 0.0; restores across restarts; only increases; 3 decimals.
     """
     _attr_device_class               = SensorDeviceClass.ENERGY
@@ -733,7 +863,7 @@ class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
     @callback
     def _update(self) -> None:
         # Zero-fill unknown inputs (see Total Electrical Power). new_kw stays a
-        # number whenever the entity is available, so cooling energy keeps
+        # number whenever the entity is available, so pump energy keeps
         # integrating through passive-cooling spells when status_dhw is dormant.
         now       = time.monotonic()
         thermal   = self._coord.get_value(DP_THERMAL_POWER)
@@ -741,10 +871,12 @@ class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
         cop       = self._coord.cop
         hp_elec   = (0.0 if (thermal is None or thermal == 0.0 or cop == 0.0)
                      else thermal / cop)
-        heater_elec  = self._coord.heater_power_kw if heater_on else 0.0
-        cooling_elec = (self._coord.cooling_power_kw
-                        if self._coord.passive_cooling_on else 0.0)
-        new_kw    = hp_elec + heater_elec + cooling_elec
+        heater_elec = self._coord.heater_power_kw if heater_on else 0.0
+        pumps_on    = bool(self._coord.pumps_active)
+        brine_elec   = self._coord.brine_pump_kw if pumps_on else 0.0
+        heating_elec = self._coord.heating_pump_kw if pumps_on else 0.0
+        standby_elec = self._coord.standby_kw
+        new_kw = hp_elec + heater_elec + brine_elec + heating_elec + standby_elec
         self._integrate(now, new_kw)
         self._attr_native_value = round(self._total_kwh, 3)
         self.async_write_ha_state()

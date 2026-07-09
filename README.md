@@ -1,7 +1,7 @@
 # Hoval CAN — Home Assistant Integration
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz)
-![Version](https://img.shields.io/badge/version-0.2.8-blue)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
 ![HA min version](https://img.shields.io/badge/HA-2023.1%2B-green)
 
 Local-push integration for Hoval heat pump systems with the **WLAN Gateway**. Connects to the proprietary CAN-BUS TCP stream on port 3113. No cloud, no Modbus module required. Strictly **read-only** — nothing is ever written to the bus.
@@ -33,14 +33,19 @@ Enter the gateway IP address. Port defaults to 3113. HA tests the connection bef
 | Option | Default | Range | Notes |
 |---|---|---|---|
 | **Electric Heater Rated Power** | 3.0 kW | 0.5–12.0 kW | Check unit data plate |
+| **Passive Cooling Power** | 100 W | 0–500 W | Legacy — kept for its own entity's history; **no longer** part of Total Electrical Power/Energy (see below) |
+| **Ground-Loop Source Temperature** | 12.5 °C | −5–25 °C | No CAN datapoint reports this; adjust manually as the ground loop shifts seasonally. Feeds the COP lift calculation |
+| **Brine/Source Pump Power** | 30 W | 0–200 W | Ground-loop circulation pump. Same class of high-efficiency pump as the heating-circuit pump per Hoval's spec sheet — **estimate**, confirm against the actual pump if you can |
+| **Heating Circuit Pump Power** | 20 W | 0–100 W | Median of the pump's own nameplate dynamic range (4–40 W) |
+| **Standby Power** | 12 W | 0–100 W | TopTronic E controller + 3-way valve actuator idle draw. Always added, independent of heat pump/DHW/cooling state |
 
-COP is **not** configurable — it is calculated automatically from live sensor data (see below).
+COP is **not** configurable — it is calculated automatically from live sensor data (see below); only the source temperature it needs is exposed here.
 
 ---
 
 ## Entities
 
-### Sensors (48)
+### Sensors (56)
 
 #### Temperatures (7)
 `outdoor_temp`, `room_temp`, `flow_temp`, `dhw_temp`, `heat_gen_temp`, `solar_storage_temp`\*, `circulation_temp`\*
@@ -55,13 +60,18 @@ COP is **not** configurable — it is calculated automatically from live sensor 
 |---|---|
 | `sensor.hoval_can_heat_pump_cop` | Live calculated COP; 0.0 when not running |
 
-#### Electrical Power & Energy (6) — new in v0.2
+#### Electrical Power & Energy (11) — extended in v0.3.0
 | Entity | Unit | Persists |
 |---|---|---|
 | `sensor.hoval_can_heat_pump_electrical_power` | kW | — |
 | `sensor.hoval_can_heat_pump_electrical_energy` | kWh | ✅ |
 | `sensor.hoval_can_electric_heater_power` | kW | — |
 | `sensor.hoval_can_electric_heater_energy` | kWh | ✅ |
+| `sensor.hoval_can_passive_cooling_power` | kW | — (legacy — no longer part of Total, see below) |
+| `sensor.hoval_can_passive_cooling_energy` | kWh | ✅ (legacy — no longer part of Total, see below) |
+| `sensor.hoval_can_brine_pump_power` | kW | — |
+| `sensor.hoval_can_heating_pump_power` | kW | — |
+| `sensor.hoval_can_standby_power` | kW | — |
 | `sensor.hoval_can_total_electrical_power` | kW | — |
 | `sensor.hoval_can_total_electrical_energy` | kWh | ✅ |
 
@@ -85,10 +95,11 @@ COP is calculated automatically from two live sensor values — **no HA template
 |---|---|---|
 | `m` — modulation % | `sensor.hoval_can_compressor_modulation` | 20052 |
 | `t` — heat generator °C | `sensor.hoval_can_heat_generator_temperature` | 7 |
+| `t_source` — ground-loop temperature °C | *(no CAN datapoint — Options → Ground-Loop Source Temperature, default 12.5 °C)* | — |
 
 ### Two-regime formula
 
-**Guard-rails:** if `m ≤ 1` or `t ≤ 12.5 °C` → COP = 0.0 (heat pump off / cold start)
+**Guard-rails:** if `m ≤ 1` or `t ≤ t_source` → COP = 0.0 (heat pump off / cold start)
 
 **Space Heating regime** (t ≤ 40 °C) — low temperature lift:
 ```
@@ -96,9 +107,9 @@ cop_base = 0.5833 × m            if m < 12
          = 7.0                   if 12 ≤ m ≤ 22
          = 7.988 − 0.0449 × m   if m > 22
 
-COP = cop_base × (17.5 / (t − 12.5))
+COP = cop_base × (17.5 / (t − t_source))
 ```
-Reference: lift = 17.5 °C → t_gen = 30 °C
+Reference: lift = 17.5 °C at t_source = 12.5 °C → t_gen = 30 °C
 
 **DHW regime** (t > 40 °C) — high temperature lift:
 ```
@@ -106,9 +117,9 @@ cop_base = 4.626 − 0.0417 × m   if m ≤ 33
          = 3.679 − 0.0130 × m   if 33 < m ≤ 60
          = 3.500 − 0.0100 × m   if m > 60
 
-COP = cop_base × (39.5 / (t − 12.5))
+COP = cop_base × (39.5 / (t − t_source))
 ```
-Reference: lift = 39.5 °C → t_gen = 52 °C
+Reference: lift = 39.5 °C at t_source = 12.5 °C → t_gen = 52 °C
 
 Final result clamped to [1.0, 8.5].
 
@@ -157,7 +168,7 @@ template:
              has_value('sensor.hoval_can_heat_generator_temperature') }}
 ```
 
-This should always match `sensor.hoval_can_heat_pump_cop` — it is the same formula using the same source entities.
+This should always match `sensor.hoval_can_heat_pump_cop` — it is the same formula using the same source entities. **Note:** the template above hardcodes `t_source = 12.5` — if you've changed the Ground-Loop Source Temperature option away from the default, update this line to match, or the verification will drift from the live sensor.
 
 ### Physical basis
 
@@ -171,12 +182,12 @@ The formula models two distinct operating regimes with live temperature-lift cor
 
 ## Electrical Energy Calculation
 
-### Heat pump
+### Heat pump (compressor)
 ```
-elec_power  = thermal_kW / COP(m, T_gen)   [0 when COP=0]
+elec_power  = thermal_kW / COP(m, T_gen, source_temp)   [0 when COP=0]
 elec_energy += elec_power × elapsed_hours   (left Riemann sum, ~2 s intervals)
 ```
-COP at the start of each interval is stored so accuracy is maintained when COP changes between updates.
+COP at the start of each interval is stored so accuracy is maintained when COP changes between updates. `source_temp` is the configurable Ground-Loop Source Temperature option (default 12.5 °C) — no CAN datapoint reports it.
 
 ### Electric heater
 ```
@@ -184,14 +195,34 @@ elec_power  = heater_rated_kW   (when heater active)
 elec_energy += elec_power × elapsed_hours
 ```
 
+### Brine pump / Heating pump (new in v0.3.0)
+```
+pumps_active = heat_pump_active (modulation > threshold) OR passive_cooling_on
+elec_power    = brine_pump_kw + heating_pump_kw   (when pumps_active)
+elec_energy  += elec_power × elapsed_hours
+```
+Both pumps share the same trigger: they run whenever the compressor is drawing (heating/DHW) *or* the heating circuit is in passive/free cooling, since passive cooling circulates the ground loop through the floor circuit with the compressor bypassed.
+
+### Standby (new in v0.3.0)
+```
+elec_power = standby_kw   (always, whenever the gateway is connected)
+```
+Not zero-filled like the other terms — this is the one component that's always a real number, so Total Electrical Power never sits at an artificial 0 during idle periods.
+
 ### Total
-Independent counter — not a runtime sum of sub-sensors.
+Independent counter — not a runtime sum of sub-sensors. As of v0.3.0:
+```
+total = heat_pump_elec + heater_elec + brine_pump_elec + heating_pump_elec + standby_elec
+```
+Passive Cooling Power/Energy (the pre-v0.3.0 lump estimate) is **no longer** part of this sum — it modelled the same physical pumps that Brine Pump Power + Heating Pump Power now cover individually; keeping both would double-count. The Passive Cooling entities themselves are unchanged and still update, purely so their own history isn't lost.
 
 ### HA Energy Dashboard
 Add individually under **Settings → Energy → Individual devices**:
 - `sensor.hoval_can_heat_pump_electrical_energy`
 - `sensor.hoval_can_electric_heater_energy`
 - `sensor.hoval_can_total_electrical_energy`
+
+`sensor.hoval_can_total_electrical_energy` keeps the same `unique_id`/`entity_id` across the v0.3.0 upgrade — no dashboard changes needed, the counter just accrues a bit faster going forward (extra standby + pump load that wasn't tracked before).
 
 ---
 
@@ -214,7 +245,55 @@ lags and condition 3 alone would briefly read true. Verified against a full
 
 ---
 
+## Auxiliary Loads (Brine Pump, Heating Pump, Standby) — new in v0.3.0
+
+Beyond the compressor and the DHW heater, three more always-relevant loads are now modelled, each configurable in Options:
+
+| Load | Entity | Trigger | Default |
+|---|---|---|---|
+| Ground-loop (brine/source) pump | `sensor.hoval_can_brine_pump_power` | Compressor active **or** passive cooling active | 30 W |
+| Heating-circuit pump | `sensor.hoval_can_heating_pump_power` | Same trigger as brine pump | 20 W |
+| Standby (controller + valve actuator) | `sensor.hoval_can_standby_power` | Always, whenever connected | 12 W |
+
+The brine and heating pump share a trigger because passive ("free") cooling circulates the ground loop through the floor circuit with the compressor bypassed — both pumps physically run in that mode, not just during active heating/DHW. This is why the older single `cooling_power_kw` estimate was retired from the Total calculation: it modelled the same two pumps as one lump figure, and keeping it alongside the new per-pump terms would double-count.
+
+The brine pump's default (30 W) is an estimate — Hoval's own spec sheet confirms it's the same class of speed-regulated high-efficiency circulator as the heating-circuit pump (not a separate high-draw unit), but the exact wattage hasn't been independently measured on this installation. Update the option once you've confirmed it against the actual pump.
+
+---
+
+## Restart Persistence — new in v0.3.0
+
+CAN only re-broadcasts a datapoint when its value changes, which is a problem for Total Electrical Power specifically: if HA restarts while, say, the Heat Pump Status hasn't changed in hours, that datapoint might not arrive again for a long time — leaving the derived power sensors sitting at Unknown in the interim, which breaks the Energy dashboard's long-term statistics for that gap.
+
+To close this, the coordinator now persists the last-known value of the datapoints that feed `cop`, `electric_heater_on`, `passive_cooling_on`, and `heat_pump_active`/`pumps_active` (`status_heat_pump`, `status_heating_circuit`, `status_dhw`, `compressor_modulation`, `heat_gen_temp`, `current_heating_power`, `dhw_temp`, `dhw_setpoint`) using Home Assistant's `Store` helper, debounced to one write per 30 s. On restart, this is loaded *before* the sensor platform is even set up, and replayed as dispatcher signals once entities are subscribed — so Total Electrical Power resolves to a real number immediately after a restart instead of waiting for the next CAN broadcast.
+
+Live CAN data always overwrites a restored value the moment it arrives. A corrupt or missing store degrades gracefully to a cold start (today's pre-v0.3.0 behaviour) rather than blocking the integration from loading.
+
+---
+
 ## Changelog
+
+### v0.3.0 — Auxiliary loads, configurable source temp, restart persistence
+- **New options:** Ground-Loop Source Temperature (12.5 °C default, replaces the
+  hardcoded COP source-temperature constant), Brine/Source Pump Power (30 W),
+  Heating Circuit Pump Power (20 W), Standby Power (12 W).
+- **New entities:** Brine Pump Power, Heating Pump Power, Standby Power (all
+  kW). Brine/heating pump power is active whenever the compressor is drawing
+  *or* the heating circuit is in passive/free cooling.
+- **Total Electrical Power/Energy** now includes the two pumps and standby;
+  the older `cooling_power_w` lump estimate is retired from the Total (it
+  modelled the same pumps as one figure — see "Auxiliary Loads" above) but its
+  own entity is unchanged, so its history isn't lost. Standby is never
+  zero-filled, so the Total never reads an artificial 0 while the gateway is
+  connected. `unique_id`/`entity_id` for both Total entities are **unchanged**
+  — no dashboard changes needed.
+- **New: coordinator-level restart persistence** (see "Restart Persistence"
+  above) — closes a real gap where CAN's on-change-only broadcasting could
+  leave Total Electrical Power at Unknown for a long time after a restart.
+- Tests extended: new option defaults/overrides/clamping, `calculate_cop` with
+  a custom source temperature, `heat_pump_active`/`pumps_active` transition
+  logic, and a full save → restart → load → signal-replay → live-overwrite
+  persistence round-trip against a functional in-memory `Store` stub.
 
 ### v0.2.8 — Total electrical zero-fills unknown inputs
 - **Total Electrical Power/Energy now zero-fill unknown inputs** instead of
