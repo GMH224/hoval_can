@@ -69,10 +69,27 @@ COOLING_POWER_MAX        = 500.0        # W
 # Ground-source heat-source ("brine"/Sole) loop temperature. No CAN datapoint
 # reports this — the Rücklauf/Vorlauf Erdsonde gauges on this installation are
 # analog-only. Manual, seasonally-adjusted estimate; feeds the COP lift calc.
+# Default raised 12.5 → 16.5 °C in v0.3.1: measured on the analog gauge during
+# an active DHW charge (July 2026, 200 m borehole with summer passive-cooling
+# recharge — expected winter value ~15 °C, so the annual swing is small).
 CONF_SOURCE_TEMP             = "source_temp_c"
-DEFAULT_SOURCE_TEMP_C: float = 12.5     # °C
+DEFAULT_SOURCE_TEMP_C: float = 16.5     # °C
 SOURCE_TEMP_MIN              = -5.0     # °C
 SOURCE_TEMP_MAX              = 25.0     # °C
+
+# Heat-exchanger approach temperature ("k", v0.3.1). The compressor actually
+# works between T_evap ≈ T_source − approach and T_cond ≈ T_gen + approach, so
+# the EFFECTIVE lift never shrinks to zero even when the water-side lift does.
+# Adding k to both the reference and the actual lift (see calculate_cop)
+# preserves the calibrated anchor points exactly while removing the 1/lift
+# divergence at small lifts — which with a 16.5 °C source and floor-heating
+# flow temperatures would otherwise pin the COP at the 8.5 clamp for most of
+# the heating season. Calibrate against the DpId 23009 hardware counter:
+# each ±1 °C of k moves computed SH electricity by roughly ∓2-3 %.
+CONF_APPROACH_K            = "cop_approach_k_c"
+DEFAULT_APPROACH_K_C: float = 7.0   # °C — combined evaporator+condenser approach
+APPROACH_K_MIN             = 0.0    # °C  (0 reproduces the pre-v0.3.1 formula)
+APPROACH_K_MAX             = 15.0   # °C
 
 # Ground-loop (brine/source) circulation pump. Per Hoval's own spec sheet this
 # is "je eine drehzahlregulierte Hocheffizienzpumpe heizungs- bzw. soleseitig"
@@ -159,51 +176,95 @@ DHW_STATUS_CHARGING = 8
 HC_STATUS_PASSIVE_COOLING = 9   # status_heating_circuit value for passive cooling
 
 # ── Dynamic COP formula ───────────────────────────────────────────────────
-# Two-regime model using live temperature lift.
+# Two-regime model using live temperature lift, with an approach-temperature
+# ("k") correction and a blended regime transition (both v0.3.1).
 #
 # COP inputs:
 #   m      = compressor modulation %     (DpId 20052 → sensor.hoval_can_compressor_modulation)
 #   t      = heat generator temperature °C (DpId 7 → sensor.hoval_can_heat_generator_temperature)
 #
-# Regime selection: t ≤ 40 °C → Space Heating;  t > 40 °C → DHW
+# Regime selection: t ≤ 38 °C → Space Heating;  t ≥ 42 °C → DHW;
+#                   38 < t < 42 °C → linear blend of both regimes (v0.3.1 —
+#                   removes the ~16-19 % power step the hard 40 °C split
+#                   produced mid-DHW-charge).
 #
-# Lift correction: COP scales inversely with temperature lift (t − t_source).
-#   Space heating reference lift : 17.5 °C  → t_gen reference = 30 °C
-#   DHW reference lift            : 39.5 °C  → t_gen reference = 52 °C
+# Lift correction (v0.3.1): COP scales with (ref_lift + k) / (lift + k),
+# where k models the combined evaporator + condenser heat-exchanger approach
+# temperatures. Adding k to numerator AND denominator preserves the calibrated
+# anchors exactly (lift = 17.5 °C SH, lift = 39.5 °C DHW) while saturating the
+# curve at small lifts instead of diverging into the clamp:
+#   Space heating reference lift : 17.5 °C  → t_gen reference = 30 °C @ src 12.5
+#   DHW reference lift            : 39.5 °C  → t_gen reference = 52 °C @ src 12.5
+# k = 0 reproduces the pre-v0.3.1 bare-lift formula bit-for-bit.
 #
 # Guard-rails:
 #   m ≤ 1  or  t ≤ t_source  →  return 0.0  (heat pump off / cold start)
-#   Final COP clamped to [COP_MIN, COP_MAX]
+#   Final COP clamped to [COP_CLAMP_MIN, COP_CLAMP_MAX]
 
-COP_SOURCE_TEMP: float  = 12.5   # °C — heat source temperature (ground/air)
+COP_SOURCE_TEMP: float  = DEFAULT_SOURCE_TEMP_C  # °C — fallback only; kept in
+                                                 # lockstep with the option default
 COP_SH_LIFT_REF: float  = 17.5   # °C — space heating reference lift
 COP_DHW_LIFT_REF: float = 39.5   # °C — DHW reference lift
-COP_SH_MAX_TGEN: float  = 40.0   # °C — T_gen threshold between regimes
+COP_SH_MAX_TGEN: float  = 40.0   # °C — nominal regime split (blend centre)
+COP_BLEND_LOW_TGEN: float  = 38.0  # °C — pure Space Heating below this (v0.3.1)
+COP_BLEND_HIGH_TGEN: float = 42.0  # °C — pure DHW above this (v0.3.1)
 COP_CLAMP_MIN: float    = 1.0
 COP_CLAMP_MAX: float    = 8.5
+
+
+def _cop_base_sh(modulation: float) -> float:
+    """Space-heating part-load efficiency curve (calibrated)."""
+    if modulation < 12.0:
+        return 0.5833 * modulation
+    if modulation <= 22.0:
+        return 7.0
+    return 7.988 - (0.0449 * modulation)
+
+
+def _cop_base_dhw(modulation: float) -> float:
+    """DHW part-load efficiency curve (calibrated)."""
+    if modulation <= 33.0:
+        return 4.626 - (0.0417 * modulation)
+    if modulation <= 60.0:
+        return 3.679 - (0.0130 * modulation)
+    return 3.500 - (0.0100 * modulation)
 
 
 def calculate_cop(
     modulation: float,
     heat_gen_temp: float,
     source_temp: float = COP_SOURCE_TEMP,
+    approach_k: float = DEFAULT_APPROACH_K_C,
 ) -> float:
     """Dynamic COP from compressor modulation and heat generator temperature.
 
-    Two-regime piecewise model calibrated against real operating data.
-    Faithfully implements the user-provided HA template formula.
+    Two-regime piecewise model calibrated against real operating data,
+    refined in v0.3.1 with an approach-temperature term and a blended
+    regime transition:
 
-    Space Heating (heat_gen_temp ≤ 40 °C):
+    Space Heating (heat_gen_temp ≤ 38 °C):
         cop_base = 0.5833×m           if m < 12
                  = 7.0                if 12 ≤ m ≤ 22
                  = 7.988 − 0.0449×m  if m > 22
-        COP = cop_base × (17.5 / lift)
+        COP = cop_base × (17.5 + k) / (lift + k)
 
-    DHW (heat_gen_temp > 40 °C):
+    DHW (heat_gen_temp ≥ 42 °C):
         cop_base = 4.626 − 0.0417×m  if m ≤ 33
                  = 3.679 − 0.0130×m  if 33 < m ≤ 60
                  = 3.500 − 0.0100×m  if m > 60
-        COP = cop_base × (39.5 / lift)
+        COP = cop_base × (39.5 + k) / (lift + k)
+
+    38 °C < heat_gen_temp < 42 °C: linear blend of the two regime values
+    (weight (t − 38)/4 toward DHW), removing the step discontinuity the
+    hard 40 °C split produced in the electrical-power output mid-charge.
+
+    ``approach_k`` (default DEFAULT_APPROACH_K_C = 7.0 °C, configurable via
+    the CONF_APPROACH_K option) models the combined heat-exchanger approach
+    temperatures: the refrigerant works between roughly T_source − approach
+    and T_gen + approach, so the effective lift saturates instead of going
+    to zero. Because k is added to the reference lift as well, the model is
+    unchanged at its calibration anchors; k = 0 reproduces the pre-v0.3.1
+    formula exactly.
 
     ``source_temp`` defaults to COP_SOURCE_TEMP but is normally passed in from
     the coordinator's configurable, seasonally-adjustable option (there is no
@@ -216,26 +277,19 @@ def calculate_cop(
     if modulation <= 1.0 or heat_gen_temp <= source_temp:
         return 0.0
 
-    lift = heat_gen_temp - source_temp
+    k = max(0.0, approach_k)
+    lift_eff = (heat_gen_temp - source_temp) + k
+    cop_sh = _cop_base_sh(modulation) * ((COP_SH_LIFT_REF + k) / lift_eff)
+    cop_dhw = _cop_base_dhw(modulation) * ((COP_DHW_LIFT_REF + k) / lift_eff)
 
-    if heat_gen_temp <= COP_SH_MAX_TGEN:
-        # ── Space heating regime ──────────────────────────────────────────
-        if modulation < 12.0:
-            cop_base = 0.5833 * modulation
-        elif modulation <= 22.0:
-            cop_base = 7.0
-        else:
-            cop_base = 7.988 - (0.0449 * modulation)
-        cop = cop_base * (COP_SH_LIFT_REF / lift)
+    if heat_gen_temp <= COP_BLEND_LOW_TGEN:
+        cop = cop_sh
+    elif heat_gen_temp >= COP_BLEND_HIGH_TGEN:
+        cop = cop_dhw
     else:
-        # ── DHW regime ────────────────────────────────────────────────────
-        if modulation <= 33.0:
-            cop_base = 4.626 - (0.0417 * modulation)
-        elif modulation <= 60.0:
-            cop_base = 3.679 - (0.0130 * modulation)
-        else:
-            cop_base = 3.500 - (0.0100 * modulation)
-        cop = cop_base * (COP_DHW_LIFT_REF / lift)
+        w = ((heat_gen_temp - COP_BLEND_LOW_TGEN)
+             / (COP_BLEND_HIGH_TGEN - COP_BLEND_LOW_TGEN))
+        cop = (1.0 - w) * cop_sh + w * cop_dhw
 
     return max(COP_CLAMP_MIN, min(COP_CLAMP_MAX, round(cop, 4)))
 

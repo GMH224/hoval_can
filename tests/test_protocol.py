@@ -159,16 +159,58 @@ def _frame(cmd, group, dpid, value):
 
 
 def test_cop():
-    print("== COP validation points ==")
+    print("== COP validation points (v0.3.1: approach-k + regime blend) ==")
     cop = const.calculate_cop
-    approx("SH t=30 m=12", cop(12, 30), 7.0)
-    approx("SH t=30 m=33", cop(33, 30), 6.51)
-    approx("SH t=30 m=50", cop(50, 30), 5.74)
-    approx("DHW t=52 m=33", cop(33, 52), 3.25)
-    approx("DHW t=52 m=100", cop(100, 52), 2.50)
+
+    # Calibration anchors (lift == reference lift) are k-INVARIANT by
+    # construction: (ref+k)/(lift+k) == 1 at the anchor. Pin them with the
+    # historical source_temp=12.5 explicitly (option default is now 16.5).
+    approx("anchor SH t=30 m=12 src=12.5", cop(12, 30, 12.5), 7.0)
+    approx("anchor SH t=30 m=33 src=12.5", cop(33, 30, 12.5), 6.51)
+    approx("anchor SH t=30 m=50 src=12.5", cop(50, 30, 12.5), 5.74)
+    approx("anchor DHW t=52 m=33 src=12.5", cop(33, 52, 12.5), 3.25)
+    approx("anchor DHW t=52 m=100 src=12.5", cop(100, 52, 12.5), 2.50)
+    # ... and independently of k:
+    approx("anchor k-invariant (k=0)",  cop(50, 30, 12.5, 0.0), 5.74)
+    approx("anchor k-invariant (k=15)", cop(50, 30, 12.5, 15.0), 5.74)
+
+    # k=0 reproduces the pre-v0.3.1 bare-lift formula OFF-anchor too
+    # (legacy: cop_base * ref/lift).
+    approx("legacy k=0 SH t=35 m=50",  cop(50, 35, 12.5, 0.0), 4.4668)
+    approx("legacy k=0 DHW t=45 m=50", cop(50, 45, 12.5, 0.0), 3.6814)
+
+    # k>0 saturates the lift correction: raises COP above the bare-lift value
+    # when lift > ref side of the curve is steep (off-anchor, larger lift).
+    approx("k=7 SH t=35 m=50", cop(50, 35, 12.5, 7.0), 4.7696)
+    expect("k raises COP off-anchor (lift>ref)",
+           cop(50, 35, 12.5, 7.0) > cop(50, 35, 12.5, 0.0))
+
+    # Regime blend (38-42 °C): continuous at both edges, monotone across,
+    # strictly between the pure-regime endpoint values at the centre.
+    lo  = cop(50, 38.0, 12.5, 7.0)
+    mid = cop(50, 40.0, 12.5, 7.0)
+    hi  = cop(50, 42.0, 12.5, 7.0)
+    approx("blend edge t=38 == pure SH",  lo, 4.3293)
+    approx("blend edge t=42 == pure DHW", hi, 3.8589)
+    approx("blend centre t=40",           mid, 4.0805)
+    expect("blend strictly between endpoints", hi < mid < lo)
+    # Continuity: values just inside the window stay within 1% of the edges.
+    expect("blend continuous at low edge",
+           abs(cop(50, 38.01, 12.5, 7.0) - lo) < 0.05)
+    expect("blend continuous at high edge",
+           abs(cop(50, 41.99, 12.5, 7.0) - hi) < 0.05)
+
+    # New defaults (source_temp 16.5, k 7.0) at this installation's typical
+    # operating points.
+    approx("defaults SH t=30 m=30",  cop(30, 30), 7.9368)
+    approx("defaults DHW t=52 m=50", cop(50, 52), 3.3141)
+
+    # Guards & clamps (against the NEW default source temp).
     expect("off m<=1 -> 0", cop(1, 30) == 0.0)
-    expect("cold t<=12.5 -> 0", cop(50, 12.5) == 0.0)
-    expect("clamp max 8.5", cop(15, 13.0) == 8.5)
+    expect("cold t<=source (16.5) -> 0", cop(50, 16.5) == 0.0)
+    expect("clamp max 8.5 at tiny lift", cop(15, 18.0) == 8.5)
+    expect("negative k treated as 0",
+           cop(50, 35, 12.5, -3.0) == cop(50, 35, 12.5, 0.0))
 
 
 def test_decode():
@@ -463,25 +505,169 @@ def test_cooling_sensors():
     approx("Total energy 1h@100W cooling -> 0.1 kWh", te._total_kwh, 0.1)
 
 
+
+def test_integrator_resample():
+    """v0.3.1: energy integrators re-sample COP inputs and commit on tick."""
+    print("== v0.3.1 integrator re-sampling ==")
+    from hoval_can import sensor as S
+
+    class FakeCoord:
+        def __init__(self):
+            self.connected = True
+            self.heater_power_kw = 3.0
+            self.brine_pump_kw = 0.03
+            self.heating_pump_kw = 0.02
+            self.standby_kw = 0.012
+            self.pumps_active = True
+            self.thermal = None
+            self._cop = 0.0
+            self.heater = False
+
+        def get_value(self, dp):
+            return self.thermal if dp == S.DP_THERMAL_POWER else None
+
+        @property
+        def cop(self):
+            return self._cop
+
+        @property
+        def electric_heater_on(self):
+            return self.heater
+
+        @property
+        def passive_cooling_on(self):
+            return False
+
+    # ── HP energy: _sample integrates at start-of-interval values, and a
+    # COP change mid-plateau (constant thermal) re-arms the interval ───────
+    fc = FakeCoord()
+    hp = object.__new__(S.HovalHeatPumpElecEnergySensor)
+    hp._coord = fc
+    hp._total_kwh = 0.0
+    hp._last_thermal = None
+    hp._last_cop = 0.0
+    hp._last_ts = None
+    hp._attr_native_value = 0.0
+    hp.async_write_ha_state = lambda: None
+
+    fc.thermal, fc._cop = 6.0, 4.0
+    hp._sample(1000.0, write_always=True)              # arm
+    fc._cop = 3.0                                      # T_gen rose, COP fell
+    hp._sample(1000.0 + 1800.0, write_always=True)     # 0.5 h @ 6/4 = 0.75
+    approx("HP: first half-hour at COP 4", hp._total_kwh, 0.75)
+    hp._sample(1000.0 + 3600.0, write_always=True)     # 0.5 h @ 6/3 = 1.0
+    approx("HP: second half-hour at COP 3", hp._total_kwh, 1.75)
+    # Without the modulation/T_gen subscriptions the whole hour would have
+    # been integrated at COP 4 (1.5 kWh) — the re-sample recovers 0.25 kWh.
+
+    # None thermal resets tracking (gap safety, unchanged behaviour)
+    fc.thermal = None
+    hp._sample(1000.0 + 7200.0, write_always=True)
+    approx("HP: None resets without integrating", hp._total_kwh, 1.75)
+    expect("HP: tracking cleared", hp._last_ts is None)
+
+    # Tick path: guarded on connected — must not integrate while down
+    fc.thermal, fc._cop = 6.0, 3.0
+    hp._sample(10000.0, write_always=True)             # re-arm
+    fc.connected = False
+    before = hp._total_kwh
+    hp._tick(None)                                     # wall-clock arg unused
+    approx("HP: tick no-op while disconnected", hp._total_kwh, before)
+
+    # Tick must never ARM tracking either (post-reconnect, coordinator data
+    # may be stale until the first fresh 29051 broadcast — only a dispatcher
+    # signal may open an interval, matching pre-v0.3.1 semantics).
+    fc.connected = True
+    hp._last_thermal, hp._last_cop, hp._last_ts = None, 0.0, None
+    hp._tick(None)
+    expect("HP: tick does not arm from cleared tracking", hp._last_ts is None)
+
+    # ── Total energy: _current_kw recomputes from live state; tick commits
+    # at the RECOMPUTED rate, not the stale armed rate ─────────────────────
+    fc = FakeCoord()
+    te = object.__new__(S.HovalTotalElecEnergySensor)
+    te._coord = fc
+    te._total_kwh = 0.0
+    te._last_elec_kw = None
+    te._last_ts = None
+    te._attr_native_value = 0.0
+    te.async_write_ha_state = lambda: None
+
+    fc.thermal, fc._cop = 6.0, 3.0     # hp 2.0 + pumps 0.05 + standby 0.012
+    approx("Total: _current_kw live recompute", te._current_kw(), 2.062)
+    fc.heater = True
+    approx("Total: _current_kw includes heater", te._current_kw(), 5.062)
+    fc.heater = False
+
+    te._last_elec_kw = 2.062
+    te._last_ts = 1000.0
+    fc._cop = 2.0                       # rate rises to 6/2+0.062 = 3.062
+    te._integrate(1000.0 + 3600.0, te._current_kw())
+    approx("Total: hour committed at armed 2.062", te._total_kwh, 2.062)
+    approx("Total: re-armed at recomputed 3.062", te._last_elec_kw, 3.062)
+
+    # Tick never arms from nothing (startup semantics unchanged)
+    te2 = object.__new__(S.HovalTotalElecEnergySensor)
+    te2._coord = fc
+    te2._total_kwh = 0.0
+    te2._last_elec_kw = None
+    te2._last_ts = None
+    te2._attr_native_value = 0.0
+    te2.async_write_ha_state = lambda: None
+    te2._tick(None)
+    expect("Total: tick does not arm from nothing", te2._last_ts is None)
+    # ... and is a no-op while disconnected even when armed
+    te._coord.connected = False
+    before = te._total_kwh
+    te._tick(None)
+    approx("Total: tick no-op while disconnected", te._total_kwh, before)
+
+
 def test_power_model_options():
     print("== new power-model options (source temp / brine / heating pump / standby) ==")
     MOD, HC = const.DP_MODULATION, const.DP_STATUS_HC
 
-    # source_temp_c: default, override, garbage
+    # source_temp_c: default (16.5 as of v0.3.1 — measured on the analog
+    # gauge during a DHW charge, July 2026), override, garbage
     co = _co_with_options({})
-    approx("default source_temp_c 12.5", co.source_temp_c, 12.5)
+    approx("default source_temp_c 16.5 (v0.3.1)", co.source_temp_c, 16.5)
     co = _co_with_options({const.CONF_SOURCE_TEMP: 9.0})
     approx("override source_temp_c 9.0", co.source_temp_c, 9.0)
     co = _co_with_options({const.CONF_SOURCE_TEMP: "bad"})
-    approx("garbage source_temp_c -> default", co.source_temp_c, 12.5)
+    approx("garbage source_temp_c -> default", co.source_temp_c, 16.5)
+
+    # approach_k_c (v0.3.1): default, override, garbage, out-of-range clamp
+    co = _co_with_options({})
+    approx("default approach_k_c 7.0", co.approach_k_c, 7.0)
+    co = _co_with_options({const.CONF_APPROACH_K: 4.0})
+    approx("override approach_k_c 4.0", co.approach_k_c, 4.0)
+    co = _co_with_options({const.CONF_APPROACH_K: "bad"})
+    approx("garbage approach_k_c -> default", co.approach_k_c, 7.0)
+    co = _co_with_options({const.CONF_APPROACH_K: -2.0})
+    approx("negative approach_k_c -> clamped 0", co.approach_k_c, 0.0)
+    co = _co_with_options({const.CONF_APPROACH_K: 99.0})
+    approx("oversized approach_k_c -> clamped max", co.approach_k_c,
+           const.APPROACH_K_MAX)
+
+    # coordinator.cop consumes BOTH options: same live data, k=0 vs k=7
+    # differ off-anchor; explicit source override shifts the lift.
+    co0 = _co_with_options({const.CONF_SOURCE_TEMP: 12.5,
+                            const.CONF_APPROACH_K: 0.0})
+    co7 = _co_with_options({const.CONF_SOURCE_TEMP: 12.5,
+                            const.CONF_APPROACH_K: 7.0})
+    for c in (co0, co7):
+        c._update_dp(const.DP_MODULATION, 50)
+        c._update_dp(const.DP_HEAT_GEN, 35.0)
+    approx("coordinator cop k=0 (legacy)", co0.cop, 4.4668)
+    approx("coordinator cop k=7",          co7.cop, 4.7696)
 
     # calculate_cop honours the passed-in source_temp (colder loop -> bigger
     # lift -> lower COP for the same modulation/T_gen than the 12.5 default)
     cop = const.calculate_cop
-    hot_default = cop(15, 30.0)             # default source_temp=12.5, lift=17.5
+    warm_loop   = cop(15, 30.0, 16.5)       # v0.3.1 default source, lift=13.5
     colder_loop = cop(15, 30.0, 9.0)        # source_temp=9.0, lift=21.0
     expect("colder source -> lower COP for same lift-independent inputs",
-           colder_loop < hot_default)
+           colder_loop < warm_loop)
 
     # brine_pump_kw / heating_pump_kw / standby_kw: default, override,
     # garbage, negative -> all clamp to >= 0
@@ -765,6 +951,7 @@ def main():
     test_integrator_math()
     test_cooling_coordinator()
     test_cooling_sensors()
+    test_integrator_resample()
     test_power_model_options()
     test_persistence()
     test_diagnostics()

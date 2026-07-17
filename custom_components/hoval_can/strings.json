@@ -29,6 +29,7 @@
           "heater_power_kw": "Electric Heater Rated Power (kW)",
           "cooling_power_w": "Passive Cooling Power (W) — legacy, no longer used in Total Electrical Power",
           "source_temp_c": "Ground-Loop Source Temperature (°C)",
+          "cop_approach_k_c": "COP Approach Temperature k (°C)",
           "brine_pump_power_w": "Brine/Source Pump Power (W)",
           "heating_pump_power_w": "Heating Circuit Pump Power (W)",
           "standby_power_w": "Standby Power (W)"
@@ -36,7 +37,8 @@
         "data_description": {
           "heater_power_kw": "Rated power of the electric DHW immersion heater (Heizstab). Common values: 2.0, 3.0, 6.0 kW. Default: 3.0 kW. Check the unit data plate. COP is calculated automatically from live sensor data and is not configurable here.",
           "cooling_power_w": "Kept for backward compatibility of its own history. No longer added to Total Electrical Power/Energy — the brine and heating-circuit pump power below now cover the same pumps during passive cooling.",
-          "source_temp_c": "Ground-loop (brine) entering-fluid temperature. There is no CAN datapoint for this — adjust manually as the ground temperature shifts seasonally. Default 12.5 °C.",
+          "source_temp_c": "Ground-loop (brine) entering-fluid temperature. There is no CAN datapoint for this — adjust manually as the ground temperature shifts seasonally (read the gauge on the line coming FROM the borehole during a long compressor run). Default 16.5 °C (measured July 2026 during a DHW charge; ~15 °C expected in winter).",
+          "cop_approach_k_c": "Combined evaporator + condenser heat-exchanger approach temperature used in the COP lift correction (v0.3.1). Preserves the calibrated reference points; prevents the COP from pinning at the 8.5 clamp at small lifts. Calibrate against the hardware energy counter (Total WEZ Electrical Energy): raise k if the integration over-reads electricity vs. the counter, lower it if it under-reads (each ±1 °C ≈ ∓2-3 % on space-heating electricity). 0 reproduces the pre-v0.3.1 formula. Default 7 °C.",
           "brine_pump_power_w": "Ground-loop circulation pump power. Runs whenever the compressor is active or during passive cooling. Same class of high-efficiency pump as the heating-circuit pump per Hoval's spec sheet — treat as an estimate unless measured. Default 30 W.",
           "heating_pump_power_w": "Heating-circuit circulation pump power. Same trigger as the brine pump. Nameplate dynamic range is 4-40 W; default is the median, 20 W.",
           "standby_power_w": "Baseline standby draw (controller electronics + 3-way valve actuator) — always added while the unit is powered, independent of heat pump/DHW/cooling state. Default 12 W."

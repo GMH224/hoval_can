@@ -19,6 +19,8 @@ from .const import (
     COOLING_POWER_MAX, COOLING_POWER_MIN,
     CONF_SOURCE_TEMP, DEFAULT_SOURCE_TEMP_C,
     SOURCE_TEMP_MAX, SOURCE_TEMP_MIN,
+    CONF_APPROACH_K, DEFAULT_APPROACH_K_C,
+    APPROACH_K_MAX, APPROACH_K_MIN,
     CONF_BRINE_PUMP_POWER, DEFAULT_BRINE_PUMP_POWER_W,
     BRINE_PUMP_POWER_MAX, BRINE_PUMP_POWER_MIN,
     CONF_HEATING_PUMP_POWER, DEFAULT_HEATING_PUMP_POWER_W,
@@ -86,8 +88,8 @@ class HovalCANConfigFlow(ConfigFlow, domain=DOMAIN):
 
 class HovalCANOptionsFlow(OptionsFlow):
     """Options: electric heater rated power, passive-cooling pump power,
-    ground-loop source temperature, brine/heating pump power, and standby
-    power.
+    ground-loop source temperature, COP approach temperature k (v0.3.1),
+    brine/heating pump power, and standby power.
 
     COP is calculated automatically from live sensor data — only the source
     (ground-loop) temperature it needs is configurable here, since no CAN
@@ -113,6 +115,9 @@ class HovalCANOptionsFlow(OptionsFlow):
         current_source_temp = float(
             opts.get(CONF_SOURCE_TEMP, DEFAULT_SOURCE_TEMP_C)
         )
+        current_approach_k = float(
+            opts.get(CONF_APPROACH_K, DEFAULT_APPROACH_K_C)
+        )
         current_brine_pump = float(
             opts.get(CONF_BRINE_PUMP_POWER, DEFAULT_BRINE_PUMP_POWER_W)
         )
@@ -136,6 +141,10 @@ class HovalCANOptionsFlow(OptionsFlow):
             vol.Required(CONF_SOURCE_TEMP, default=current_source_temp): vol.All(
                 vol.Coerce(float),
                 vol.Range(min=SOURCE_TEMP_MIN, max=SOURCE_TEMP_MAX),
+            ),
+            vol.Required(CONF_APPROACH_K, default=current_approach_k): vol.All(
+                vol.Coerce(float),
+                vol.Range(min=APPROACH_K_MIN, max=APPROACH_K_MAX),
             ),
             vol.Required(CONF_BRINE_PUMP_POWER, default=current_brine_pump): vol.All(
                 vol.Coerce(float),

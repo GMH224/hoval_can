@@ -34,7 +34,8 @@ Enter the gateway IP address. Port defaults to 3113. HA tests the connection bef
 |---|---|---|---|
 | **Electric Heater Rated Power** | 3.0 kW | 0.5–12.0 kW | Check unit data plate |
 | **Passive Cooling Power** | 100 W | 0–500 W | Legacy — kept for its own entity's history; **no longer** part of Total Electrical Power/Energy (see below) |
-| **Ground-Loop Source Temperature** | 12.5 °C | −5–25 °C | No CAN datapoint reports this; adjust manually as the ground loop shifts seasonally. Feeds the COP lift calculation |
+| **Ground-Loop Source Temperature** | 16.5 °C | −5–25 °C | No CAN datapoint reports this; adjust manually as the ground loop shifts seasonally (read the analog gauge on the line coming *from* the borehole during a long compressor run). Feeds the COP lift calculation. Default measured July 2026 during a DHW charge; ~15 °C expected in winter (200 m borehole, small annual swing) |
+| **COP Approach Temperature k** | 7.0 °C | 0–15 °C | *(v0.3.1)* Combined evaporator + condenser heat-exchanger approach temperature in the COP lift correction. Preserves the calibrated anchors; prevents the COP from pinning at the 8.5 clamp at small lifts. **Calibration knob:** raise k if the integration over-reads electricity vs. the hardware counter (Total WEZ Electrical Energy, DpId 23009), lower it if it under-reads — each ±1 °C ≈ ∓2–3 % on space-heating electricity. 0 reproduces the pre-v0.3.1 formula |
 | **Brine/Source Pump Power** | 30 W | 0–200 W | Ground-loop circulation pump. Same class of high-efficiency pump as the heating-circuit pump per Hoval's spec sheet — **estimate**, confirm against the actual pump if you can |
 | **Heating Circuit Pump Power** | 20 W | 0–100 W | Median of the pump's own nameplate dynamic range (4–40 W) |
 | **Standby Power** | 12 W | 0–100 W | TopTronic E controller + 3-way valve actuator idle draw. Always added, independent of heat pump/DHW/cooling state |
@@ -95,31 +96,50 @@ COP is calculated automatically from two live sensor values — **no HA template
 |---|---|---|
 | `m` — modulation % | `sensor.hoval_can_compressor_modulation` | 20052 |
 | `t` — heat generator °C | `sensor.hoval_can_heat_generator_temperature` | 7 |
-| `t_source` — ground-loop temperature °C | *(no CAN datapoint — Options → Ground-Loop Source Temperature, default 12.5 °C)* | — |
+| `t_source` — ground-loop temperature °C | *(no CAN datapoint — Options → Ground-Loop Source Temperature, default 16.5 °C as of v0.3.1)* | — |
+| `k` — approach temperature °C | *(Options → COP Approach Temperature k, default 7.0 °C, v0.3.1)* | — |
 
 ### Two-regime formula
 
 **Guard-rails:** if `m ≤ 1` or `t ≤ t_source` → COP = 0.0 (heat pump off / cold start)
 
-**Space Heating regime** (t ≤ 40 °C) — low temperature lift:
+Both regimes share the *effective lift* (v0.3.1):
+```
+lift_eff = (t − t_source) + k
+```
+`k` (default 7.0 °C, configurable) models the combined evaporator + condenser
+heat-exchanger approach temperatures: the refrigerant works between roughly
+`t_source − approach` and `t + approach`, so the effective lift saturates
+instead of shrinking to zero. Because `k` is added to the reference lift too,
+the model is **unchanged at its calibration anchors**, and `k = 0` reproduces
+the pre-v0.3.1 bare-lift formula exactly.
+
+**Space Heating regime** (t ≤ 38 °C) — low temperature lift:
 ```
 cop_base = 0.5833 × m            if m < 12
          = 7.0                   if 12 ≤ m ≤ 22
          = 7.988 − 0.0449 × m   if m > 22
 
-COP = cop_base × (17.5 / (t − t_source))
+COP_SH = cop_base × ((17.5 + k) / lift_eff)
 ```
-Reference: lift = 17.5 °C at t_source = 12.5 °C → t_gen = 30 °C
+Reference: lift = 17.5 °C (t_gen = 30 °C at t_source = 12.5 °C)
 
-**DHW regime** (t > 40 °C) — high temperature lift:
+**DHW regime** (t ≥ 42 °C) — high temperature lift:
 ```
 cop_base = 4.626 − 0.0417 × m   if m ≤ 33
          = 3.679 − 0.0130 × m   if 33 < m ≤ 60
          = 3.500 − 0.0100 × m   if m > 60
 
-COP = cop_base × (39.5 / (t − t_source))
+COP_DHW = cop_base × ((39.5 + k) / lift_eff)
 ```
-Reference: lift = 39.5 °C at t_source = 12.5 °C → t_gen = 52 °C
+Reference: lift = 39.5 °C (t_gen = 52 °C at t_source = 12.5 °C)
+
+**Blended transition** (38 °C < t < 42 °C, v0.3.1) — removes the ~16–19 %
+power step the previous hard 40 °C split produced mid-DHW-charge:
+```
+w   = (t − 38) / 4
+COP = (1 − w) × COP_SH + w × COP_DHW
+```
 
 Final result clamped to [1.0, 8.5].
 
@@ -138,45 +158,42 @@ template:
         state: >
           {% set m = states('sensor.hoval_can_compressor_modulation') | float(0) %}
           {% set t = states('sensor.hoval_can_heat_generator_temperature') | float(0) %}
-          {% set t_source = 12.5 %}
+          {% set t_source = 16.5 %}
+          {% set k = 7.0 %}
           {% if m <= 1 or t <= t_source %}
             0.0
           {% else %}
-            {% set lift = t - t_source %}
-            {% if t <= 40 %}
-              {% if m < 12 %}
-                {% set cop_base = 0.5833 * m %}
-              {% elif m <= 22 %}
-                {% set cop_base = 7.0 %}
-              {% else %}
-                {% set cop_base = 7.988 - (0.0449 * m) %}
-              {% endif %}
-              {{ (cop_base * (17.5 / lift)) | max(1.0) | min(8.5) | round(4) }}
+            {% set lift_eff = (t - t_source) + k %}
+            {% if m < 12 %}{% set cb_sh = 0.5833 * m %}
+            {% elif m <= 22 %}{% set cb_sh = 7.0 %}
+            {% else %}{% set cb_sh = 7.988 - (0.0449 * m) %}{% endif %}
+            {% if m <= 33 %}{% set cb_dhw = 4.626 - (0.0417 * m) %}
+            {% elif m <= 60 %}{% set cb_dhw = 3.679 - (0.0130 * m) %}
+            {% else %}{% set cb_dhw = 3.500 - (0.0100 * m) %}{% endif %}
+            {% set cop_sh  = cb_sh  * ((17.5 + k) / lift_eff) %}
+            {% set cop_dhw = cb_dhw * ((39.5 + k) / lift_eff) %}
+            {% if t <= 38 %}{% set cop = cop_sh %}
+            {% elif t >= 42 %}{% set cop = cop_dhw %}
             {% else %}
-              {% if m <= 33 %}
-                {% set cop_base = 4.626 - (0.0417 * m) %}
-              {% elif m <= 60 %}
-                {% set cop_base = 3.679 - (0.0130 * m) %}
-              {% else %}
-                {% set cop_base = 3.500 - (0.0100 * m) %}
-              {% endif %}
-              {{ (cop_base * (39.5 / lift)) | max(1.0) | min(8.5) | round(4) }}
+              {% set w = (t - 38) / 4 %}
+              {% set cop = (1 - w) * cop_sh + w * cop_dhw %}
             {% endif %}
+            {{ cop | round(4) | max(1.0) | min(8.5) }}
           {% endif %}
         availability: >
           {{ has_value('sensor.hoval_can_compressor_modulation') and
              has_value('sensor.hoval_can_heat_generator_temperature') }}
 ```
 
-This should always match `sensor.hoval_can_heat_pump_cop` — it is the same formula using the same source entities. **Note:** the template above hardcodes `t_source = 12.5` — if you've changed the Ground-Loop Source Temperature option away from the default, update this line to match, or the verification will drift from the live sensor.
+This should always match `sensor.hoval_can_heat_pump_cop` — it is the same formula using the same source entities. **Note:** the template above hardcodes `t_source = 16.5` and `k = 7.0` — if you've changed the Ground-Loop Source Temperature or COP Approach Temperature options away from their defaults, update these lines to match, or the verification will drift from the live sensor.
 
 ### Physical basis
 
 The formula models two distinct operating regimes with live temperature-lift correction:
 
 - **cop_base** captures the heat pump's efficiency curve as a function of compressor loading
-- **Lift ratio** (reference_lift / actual_lift) corrects for actual operating conditions — higher lift reduces COP, lower lift improves it, matching the second law of thermodynamics
-- **Regime split at 40 °C** separates efficient floor-heating operation from high-temperature DHW mode
+- **Lift ratio** ((reference_lift + k) / (actual_lift + k)) corrects for actual operating conditions — higher lift reduces COP, lower lift improves it, matching the second law of thermodynamics. The **approach term k** (v0.3.1) reflects that the refrigerant cycle works across the heat-exchanger approach temperatures in addition to the water-side lift, so real machines *saturate* at small lifts rather than diverging — without it, a warm summer borehole (16.5 °C) plus floor-heating flow temperatures would pin the COP at the 8.5 clamp for most of the heating season, turning the model into a hardcoded constant exactly where it runs the most
+- **Blended regime transition (38–42 °C, v0.3.1)** separates efficient floor-heating operation from high-temperature DHW mode without the step discontinuity a hard split produces in the electrical-power output mid-charge
 
 ---
 
@@ -184,10 +201,10 @@ The formula models two distinct operating regimes with live temperature-lift cor
 
 ### Heat pump (compressor)
 ```
-elec_power  = thermal_kW / COP(m, T_gen, source_temp)   [0 when COP=0]
-elec_energy += elec_power × elapsed_hours   (left Riemann sum, ~2 s intervals)
+elec_power  = thermal_kW / COP(m, T_gen, source_temp, k)   [0 when COP=0]
+elec_energy += elec_power × elapsed_hours   (left Riemann sum)
 ```
-COP at the start of each interval is stored so accuracy is maintained when COP changes between updates. `source_temp` is the configurable Ground-Loop Source Temperature option (default 12.5 °C) — no CAN datapoint reports it.
+COP at the start of each interval is stored so accuracy is maintained when COP changes between updates. As of v0.3.1 the integrator re-samples on **every COP input** — thermal power (29051), modulation (20052) *and* T_gen (7) — and a 60-second timer additionally commits the open interval at freshly recomputed values. CAN broadcasts only on change, so previously a long constant-thermal plateau (a DHW charge holding max power while T_gen climbs and COP falls) was integrated at the COP frozen at the start of the plateau; staleness is now capped at 60 s. The same applies to Total Electrical Energy, whose 60-second tick now *commits* at a recomputed rate instead of only refreshing the display. `source_temp` (default 16.5 °C) and `k` (default 7.0 °C) are the configurable options above — no CAN datapoint reports them.
 
 ### Electric heater
 ```
@@ -272,6 +289,44 @@ Live CAN data always overwrites a restored value the moment it arrives. A corrup
 ---
 
 ## Changelog
+
+### v0.3.1 — COP model refinement (approach-k, regime blend), integrator re-sampling
+- **New option: COP Approach Temperature k** (default 7.0 °C, range 0–15 °C).
+  The lift correction becomes `(ref_lift + k) / (lift + k)` — preserving the
+  calibrated anchor points exactly while saturating the curve at small lifts
+  instead of diverging into the 8.5 clamp. `k = 0` reproduces the previous
+  formula bit-for-bit. This is the calibration knob against the hardware
+  counter (Total WEZ Electrical Energy, DpId 23009): raise k if the
+  integration over-reads electricity, lower if it under-reads (±1 °C ≈ ∓2–3 %
+  on space-heating electricity).
+- **Ground-Loop Source Temperature default 12.5 → 16.5 °C** — measured on the
+  analog Erdsonde gauge during an active DHW charge (July 2026; 200 m borehole
+  with summer passive-cooling recharge, ~15 °C expected in winter). A value
+  you already saved in Options is **not** changed — the new default only
+  applies to fresh installs or if you reset the field.
+- **Blended regime transition (38–42 °C)** replaces the hard 40 °C split —
+  removes the ~16–19 % step in Heat Pump Electrical Power mid-DHW-charge.
+- **Energy integrators re-sample all COP inputs**: Heat Pump Electrical
+  Energy and Total Electrical Energy now subscribe to modulation (20052) and
+  T_gen (7) in addition to thermal power (29051), and their 60-second timer
+  *commits* the open interval at freshly recomputed values (previously the
+  Total's timer only refreshed the display and the HP integrator had no timer
+  at all). Since CAN broadcasts only on change, this caps COP staleness in
+  the integral at one minute — previously a constant-power DHW plateau was
+  integrated end-to-end at the COP frozen at its start. The timers are
+  guarded on the gateway connection, so downtime is still never integrated
+  and startup/restore semantics are unchanged.
+- **Expected effect vs. v0.3.0 at the defaults:** computed electrical
+  consumption drops ≈ 7–9 % on DHW and ≈ 12–19 % on space heating (0 % where
+  both formulas clamp) — the previous defaults systematically over-estimated.
+  Counters are TOTAL_INCREASING lifetime values: history is not rewritten,
+  only the accumulation rate changes from the upgrade onward. Note the
+  changeover date when comparing Energy-dashboard periods across it.
+- `unique_id`/`entity_id` of all entities unchanged — no dashboard edits.
+- Tests: COP suite rewritten (anchor k-invariance, k=0 legacy equivalence,
+  blend continuity/monotonicity, new defaults, clamp/guard edges); new
+  integrator re-sampling group (COP change mid-plateau, tick commit,
+  disconnect guard, no-arm-from-nothing); options tests extended for k.
 
 ### v0.3.0 — Auxiliary loads, configurable source temp, restart persistence
 - **New options:** Ground-Loop Source Temperature (12.5 °C default, replaces the

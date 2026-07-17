@@ -22,6 +22,7 @@ from .const import (
     CONF_HEATER_POWER, DEFAULT_HEATER_POWER_KW, DEFAULT_PORT,
     CONF_COOLING_POWER, DEFAULT_COOLING_POWER_W,
     CONF_SOURCE_TEMP, DEFAULT_SOURCE_TEMP_C,
+    CONF_APPROACH_K, DEFAULT_APPROACH_K_C, APPROACH_K_MIN, APPROACH_K_MAX,
     CONF_BRINE_PUMP_POWER, DEFAULT_BRINE_PUMP_POWER_W,
     CONF_HEATING_PUMP_POWER, DEFAULT_HEATING_PUMP_POWER_W,
     CONF_STANDBY_POWER, DEFAULT_STANDBY_POWER_W,
@@ -115,13 +116,15 @@ class HovalCANCoordinator:
         """Dynamic COP from live modulation and heat-generator temperature.
 
         Two-regime piecewise model (see const.calculate_cop for details):
-          • T_gen ≤ 40 °C → space heating regime
-          • T_gen >  40 °C → DHW regime
-        Returns 0.0 when the heat pump is not running.
+          • T_gen ≤ 38 °C → space heating regime
+          • T_gen ≥ 42 °C → DHW regime
+          • in between   → linear blend of both (v0.3.1)
+        The lift correction uses the configurable approach-temperature term
+        (approach_k_c, v0.3.1). Returns 0.0 when the heat pump is not running.
         """
         m = float(self._data.get(DP_MODULATION) or 0.0)
         t = float(self._data.get(DP_HEAT_GEN)   or 0.0)
-        return calculate_cop(m, t, self.source_temp_c)
+        return calculate_cop(m, t, self.source_temp_c, self.approach_k_c)
 
     @property
     def source_temp_c(self) -> float:
@@ -137,6 +140,24 @@ class HovalCANCoordinator:
             )
         except (TypeError, ValueError):
             return DEFAULT_SOURCE_TEMP_C
+
+    @property
+    def approach_k_c(self) -> float:
+        """Heat-exchanger approach temperature k, °C (options, v0.3.1).
+
+        Added to both the reference and the actual lift in calculate_cop so
+        the COP curve saturates at small lifts instead of diverging into the
+        clamp. Calibration knob against the DpId 23009 hardware counter; 0
+        reproduces the pre-v0.3.1 formula. Garbage coerced to the default,
+        out-of-range values clamped into [APPROACH_K_MIN, APPROACH_K_MAX].
+        """
+        try:
+            k = float(
+                self._entry.options.get(CONF_APPROACH_K, DEFAULT_APPROACH_K_C)
+            )
+        except (TypeError, ValueError):
+            return DEFAULT_APPROACH_K_C
+        return max(APPROACH_K_MIN, min(APPROACH_K_MAX, k))
 
     @property
     def brine_pump_kw(self) -> float:

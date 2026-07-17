@@ -1,7 +1,9 @@
 # CLAUDE.md — Hoval CAN Integration Developer Context
 
-Version 0.3.0. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
+Version 0.3.1. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
 Read-only. TCP port 3113, proprietary CAN-BUS stream.
+Installation: Hoval UltraSource T comfort (13), 2020, R410A, B0/W35 13.3 kW,
+200 m borehole (analog Erdsonde gauges only — no CAN datapoint for brine temp).
 
 ---
 
@@ -49,58 +51,78 @@ Modbus register ≠ DatapointId (different address spaces). E.g. Modbus reg 1948
 
 ## Dynamic COP (const.py :: calculate_cop)
 
-### Formula
+### Formula (v0.3.1: approach-k + blended regimes)
 ```python
-def calculate_cop(modulation: float, heat_gen_temp: float,
-                   source_temp: float = COP_SOURCE_TEMP) -> float:
+def calculate_cop(modulation, heat_gen_temp,
+                  source_temp=COP_SOURCE_TEMP,          # option default 16.5
+                  approach_k=DEFAULT_APPROACH_K_C):     # option default 7.0
     if modulation <= 1.0 or heat_gen_temp <= source_temp:
         return 0.0
-    lift = heat_gen_temp - source_temp
-    if heat_gen_temp <= 40.0:          # Space Heating
-        if modulation < 12:   cop_base = 0.5833 * modulation
-        elif modulation <= 22: cop_base = 7.0
-        else:                  cop_base = 7.988 - 0.0449 * modulation
-        cop = cop_base * (17.5 / lift)
-    else:                              # DHW
-        if modulation <= 33:   cop_base = 4.626 - 0.0417 * modulation
-        elif modulation <= 60: cop_base = 3.679 - 0.0130 * modulation
-        else:                  cop_base = 3.500 - 0.0100 * modulation
-        cop = cop_base * (39.5 / lift)
+    k = max(0.0, approach_k)
+    lift_eff = (heat_gen_temp - source_temp) + k
+    cop_sh  = _cop_base_sh(modulation)  * ((17.5 + k) / lift_eff)
+    cop_dhw = _cop_base_dhw(modulation) * ((39.5 + k) / lift_eff)
+    if heat_gen_temp <= 38.0:   cop = cop_sh
+    elif heat_gen_temp >= 42.0: cop = cop_dhw
+    else:                       # linear blend, weight (t-38)/4 toward DHW
+        w = (heat_gen_temp - 38.0) / 4.0
+        cop = (1 - w) * cop_sh + w * cop_dhw
     return max(1.0, min(8.5, round(cop, 4)))
 ```
-`source_temp` defaults to `COP_SOURCE_TEMP` (12.5) but is normally called
-from `coordinator.cop`, which passes `coordinator.source_temp_c` — the
-configurable Options-flow value (v0.3.0; no CAN datapoint reports ground-loop
-temperature on this installation).
+`_cop_base_sh`: 0.5833·m (m<12) | 7.0 (12≤m≤22) | 7.988−0.0449·m (m>22)
+`_cop_base_dhw`: 4.626−0.0417·m (m≤33) | 3.679−0.0130·m (≤60) | 3.500−0.0100·m
+
+**Approach term k** (v0.3.1): added to reference AND actual lift →
+calibration anchors (lift 17.5 SH / 39.5 DHW) are k-invariant; k=0
+reproduces the pre-v0.3.1 bare-lift formula exactly. Physically: the
+refrigerant works between ~T_source−approach and ~T_gen+approach, so real
+COP saturates at small lifts instead of diverging. Without k, source 16.5 °C
++ floor-heating flow temps pin the COP at the 8.5 clamp all heating season.
+**k is the calibration knob vs. the DpId 23009 hardware counter**:
+±1 °C ≈ ∓2-3 % on SH electricity, ∓1 % on DHW.
+
+**Blend 38-42 °C** (v0.3.1): removes the ~16-19 % electrical-power step the
+hard 40 °C split produced mid-DHW-charge. Cosmetic for totals.
 
 ### Constants to recalibrate (all in const.py)
 ```python
-COP_SOURCE_TEMP  = 12.5  # fallback default only — normally overridden by the
-                         # CONF_SOURCE_TEMP option (v0.3.0)
-COP_SH_LIFT_REF  = 17.5  # space heating reference lift °C  (t_gen_ref = 30 °C)
-COP_DHW_LIFT_REF = 39.5  # DHW reference lift °C           (t_gen_ref = 52 °C)
-COP_SH_MAX_TGEN  = 40.0  # regime split temperature °C
-COP_CLAMP_MIN    = 1.0
-COP_CLAMP_MAX    = 8.5
+COP_SOURCE_TEMP     = DEFAULT_SOURCE_TEMP_C  # 16.5 °C (v0.3.1 — measured on
+                                             # the Erdsonde gauge during a DHW
+                                             # charge, July 2026; ~15 expected
+                                             # in winter). Fallback only —
+                                             # normally the CONF_SOURCE_TEMP
+                                             # option is passed in.
+DEFAULT_APPROACH_K_C = 7.0   # CONF_APPROACH_K option default (0-15)
+COP_SH_LIFT_REF     = 17.5   # °C — SH reference lift  (t_gen_ref=30 @ src 12.5)
+COP_DHW_LIFT_REF    = 39.5   # °C — DHW reference lift (t_gen_ref=52 @ src 12.5)
+COP_SH_MAX_TGEN     = 40.0   # °C — nominal split (blend centre)
+COP_BLEND_LOW_TGEN  = 38.0   # °C — pure SH below
+COP_BLEND_HIGH_TGEN = 42.0   # °C — pure DHW above
+COP_CLAMP_MIN, COP_CLAMP_MAX = 1.0, 8.5
 ```
-Piecewise coefficients (0.5833, 7.0, 7.988, 0.0449, 4.626, 0.0417, 3.679, 0.0130,
-3.500, 0.0100) are in the function body with comments — edit to recalibrate.
+Piecewise coefficients live in `_cop_base_sh` / `_cop_base_dhw` — edit to
+recalibrate. **Do NOT refit them before k and source_temp are settled** (they
+were calibrated from data where modulation and lift are correlated; refitting
+against uncorrected residuals fits noise).
 
-### Validation points (at reference lifts, default source_temp=12.5)
-- Space heating t=30°C: m=12-22% → COP=7.0; m=33% → 6.51; m=50% → 5.74
-- DHW t=52°C: m=33% → 3.25; m=60% → 2.90; m=100% → 2.50
+### Validation points
+At the anchors with explicit src=12.5 (k-invariant): SH t=30: m=12-22 → 7.0;
+m=33 → 6.51; m=50 → 5.74. DHW t=52: m=33 → 3.25; m=100 → 2.50.
+Legacy k=0 off-anchor: SH t=35 m=50 → 4.4668; DHW t=45 m=50 → 3.6814.
+Defaults (src=16.5, k=7): SH t=30 m=30 → 7.9368; DHW t=52 m=50 → 3.3141.
+Blend m=50: t=38 → 4.3293; t=40 → 4.0805; t=42 → 3.8589 (monotone).
 
 ### Entity subscriptions for COP-dependent sensors
 | Sensor | Subscribes to |
 |--------|--------------|
 | HovalDynamicCOPSensor | dp_20052, dp_7 |
 | HovalHeatPumpElecPowerSensor | dp_29051, dp_20052, dp_7 |
-| HovalHeatPumpElecEnergySensor | dp_29051 (reads cop at each update) |
+| HovalHeatPumpElecEnergySensor | dp_29051, dp_20052, dp_7 + 60 s committing tick (v0.3.1) |
 | HovalBrinePumpPowerSensor | dp_20052, cooling_signal |
 | HovalHeatingPumpPowerSensor | dp_20052, cooling_signal |
 | HovalStandbyPowerSensor | connection_signal only (constant value) |
 | HovalTotalElecPowerSensor | dp_29051, dp_20052, dp_7, heater_signal, cooling_signal |
-| HovalTotalElecEnergySensor | dp_29051, heater_signal, cooling_signal |
+| HovalTotalElecEnergySensor | dp_29051, dp_20052, dp_7, heater_signal, cooling_signal + 60 s committing tick (v0.3.1) |
 
 ---
 
@@ -177,11 +199,12 @@ Rated power from `entry.options["heater_power_kw"]` (default 3.0 kW).
 __init__.py      Setup; replays restored signals post-platform-setup;
                  options reload listener (preserves energy totals)
 config_flow.py   ConfigFlow (IP+port); OptionsFlow (heater, cooling [legacy],
-                 source_temp, brine_pump, heating_pump, standby — v0.3.0)
+                 source_temp, approach_k [v0.3.1], brine_pump, heating_pump,
+                 standby)
 coordinator.py   TCP reader; frame parser; signals; Store-backed restart
                  persistence (v0.3.0); cop / heater_power_kw / source_temp_c /
-                 brine_pump_kw / heating_pump_kw / standby_kw /
-                 heat_pump_active / pumps_active properties
+                 approach_k_c (v0.3.1) / brine_pump_kw / heating_pump_kw /
+                 standby_kw / heat_pump_active / pumps_active properties
 sensor.py        HovalSensor, HovalPersistentSensor, HovalDynamicCOPSensor,
                  HovalElectricHeaterPowerSensor, HovalElectricHeaterEnergySensor,
                  HovalPassiveCoolingPowerSensor/EnergySensor (legacy, v0.3.0),
@@ -190,10 +213,11 @@ sensor.py        HovalSensor, HovalPersistentSensor, HovalDynamicCOPSensor,
                  HovalStandbyPowerSensor (v0.3.0),
                  HovalTotalElecPowerSensor, HovalTotalElecEnergySensor
 binary_sensor.py HovalElectricHeaterBinarySensor
-const.py         All constants; calculate_cop(source_temp param, v0.3.0);
+const.py         All constants; calculate_cop(source_temp, approach_k;
+                 blended regimes — v0.3.1); _cop_base_sh/_cop_base_dhw;
                  sensor descriptions; PERSISTENT_DPIDS (extended v0.3.0);
                  STORAGE_VERSION / PERSIST_SAVE_DELAY_S (v0.3.0)
-strings.json / translations/en.json   Options UI (6 fields as of v0.3.0)
+strings.json / translations/en.json   Options UI (7 fields as of v0.3.1)
 ```
 
 ## Dispatcher signals
@@ -224,7 +248,23 @@ strings.json / translations/en.json   Options UI (6 fields as of v0.3.0)
    it's the same high-efficiency pump class as the heating-circuit pump, but
    the exact figure hasn't been independently measured on this installation;
    update `CONF_BRINE_PUMP_POWER` once confirmed.
-8. **status_heat_pump (DpId 2053)** is now decoded and persisted but not yet
+8. **Approach-k calibration (v0.3.1)** — `CONF_APPROACH_K` (default 7.0 °C)
+   is a physically-motivated estimate, not yet calibrated. Compare weekly
+   deltas of Total Electrical Energy vs. the DpId 23009 hardware counter,
+   ideally one DHW-dominated and one SH-dominated week: raise k if the
+   integration over-reads, lower if it under-reads (±1 °C ≈ ∓2-3 % SH, ∓1 %
+   DHW). Do not refit the `_cop_base_*` coefficients before k and
+   source_temp are settled.
+9. **Stale-restore integration window** — restored (persisted) nonzero
+   `current_heating_power`/`compressor_modulation` can integrate phantom
+   compressor energy after a restart if the compressor stopped while HA was
+   down (CAN broadcasts on change; the stop frame was missed and won't
+   repeat). v0.3.1's 60-s committing tick does NOT close this — it re-reads
+   the same coordinator values. Deliberately not addressed (owner decision:
+   keep startup/persistence logic untouched); bounded by the stochastic CAN
+   retransmit interval. If addressed later: gate the integrators' compressor
+   term on a live-confirmed flag rather than changing replay.
+10. **status_heat_pump (DpId 2053)** is now decoded and persisted but not yet
    consumed by any derived property — `passive_cooling_on` still reads
    `status_heating_circuit` alone. Combining both status codes (as the
    reference power-model script this was cross-checked against does) would be
@@ -233,8 +273,11 @@ strings.json / translations/en.json   Options UI (6 fields as of v0.3.0)
 ## Tests
 `python3 tests/test_protocol.py` — standalone (stubs HA, including a
 functional in-memory `Store` stub), exit 0 == pass.
-Covers COP points (incl. custom source_temp), numeric decode, adversarial
-framing, watchdog, integrators, the brine/heating-pump/standby option
-parsing and `pumps_active` transition logic, and a full persistence
-round-trip (save → simulated restart → load → signal replay → live-data
-overwrite → corrupt-store fallback).
+Covers COP points (v0.3.1: anchor k-invariance, k=0 legacy equivalence,
+blend continuity/monotonicity, defaults src=16.5/k=7, guard/clamp edges),
+numeric decode, adversarial framing, watchdog, integrators incl. the
+v0.3.1 re-sampling group (COP change mid-plateau, committing tick,
+disconnect guard, no-arm-from-nothing), option parsing for all 7 fields
+(incl. approach_k default/override/garbage/clamps) and `pumps_active`
+transitions, and a full persistence round-trip (save → simulated restart →
+load → signal replay → live-data overwrite → corrupt-store fallback).
