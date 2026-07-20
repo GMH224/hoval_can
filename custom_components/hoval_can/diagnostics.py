@@ -40,6 +40,16 @@ async def async_get_config_entry_diagnostics(
         else {"error": "coordinator not loaded"}
     )
 
+    # Health-index snapshot (v0.3.2): latest fused statistics, confidence
+    # breakdown, and the last 14 day-records — enough to audit a surprising
+    # T² value without shell access.
+    tracker = getattr(coord, "health_tracker", None)
+    health: dict[str, Any] = (
+        tracker.snapshot() if tracker is not None
+        else {"error": "health tracker not loaded"}
+    )
+
     return async_redact_data(
-        {"entry": entry_info, "coordinator": snapshot}, TO_REDACT
+        {"entry": entry_info, "coordinator": snapshot, "health": health},
+        TO_REDACT,
     )

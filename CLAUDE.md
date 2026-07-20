@@ -1,6 +1,6 @@
 # CLAUDE.md — Hoval CAN Integration Developer Context
 
-Version 0.3.1. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
+Version 0.3.2. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
 Read-only. TCP port 3113, proprietary CAN-BUS stream.
 Installation: Hoval UltraSource T comfort (13), 2020, R410A, B0/W35 13.3 kW,
 200 m borehole (analog Erdsonde gauges only — no CAN datapoint for brine temp).
@@ -39,7 +39,10 @@ Null sentinels: U16=0x8000, S16=−32768, U32=0x80000000/0xFFFFFFFF, S32=−2147
 | 2053 | status_heat_pump | `sensor.hoval_can_status_heat_pump` | U8 | Decoded, persistent (v0.3.0); not yet consumed by a derived property |
 | 4 | dhw_temp | `sensor.hoval_can_dhw_temp` | S16 dec=1 °C | Heater detection; persistent (v0.3.0) |
 | 1004 | dhw_setpoint | `sensor.hoval_can_dhw_setpoint` | S16 dec=1 °C | Heater detection; persistent (v0.3.0) |
-| 23009 | total_wez_electrical_energy | … | U32 dec=3 MWh | Hardware counter; persistent (entity-level, pre-v0.3.0) |
+| 23009 | total_wez_electrical_energy | … | U32 dec=3 MWh | Hardware counter; persistent; **health PF denominator (v0.3.2)** — 1 kWh quantisation |
+| 2080 | wez_switch_cycles | `sensor.hoval_can_wez_switch_cycles` | U32 counter | **Health CycleRate input (v0.3.2)**; added to PERSISTENT_DPIDS in v0.3.2 |
+| 2 | flow_temp | `sensor.hoval_can_flow_temperature` | S16 dec=1 °C | **Health T_sink (v0.3.2)** — Carnot term; DpId 7 is the cross-check witness |
+| 502 | active_heating_program | `sensor.hoval_can_active_heating_program` | STR | **Health mode gate (v0.3.2)** — "Sommer"/"Standby" excludes SPACE_HEATING_ACTIVE |
 
 "Persistent (v0.3.0)" = in `PERSISTENT_DPIDS`: both entity-level restore
 (`HovalPersistentSensor`) AND seeded into `coordinator._data` via the Store
@@ -159,6 +162,73 @@ double-count during passive cooling.
 
 ---
 
+## Health index (health.py, v0.3.2)
+
+Daily self-referential FDD model. **Measured inputs only** — the synthetic
+`calculate_cop()` is deliberately NOT an input (no measured electrical
+quantity in it ⇒ any η built on it is circular; this was the flaw in the
+original spec that v0.3.2 corrects).
+
+```
+CycleRate(day) = Δ dp2080                       (hardware cycles counter)
+PF(day)        = ∫ dp29051 dt / (Δ dp23009 · 1000)   [kWh_th / kWh_el]
+COP_carnot     = (flow°C+273.15)/(flow−t_source) per 5-min SH sample
+η(day)         = PF / mean(COP_carnot)          ("Gütegrad", whole-unit)
+T²             = z' Σ⁻¹ z  over trailing 90 qualifying days (min 30)
+```
+
+Two layers in `health.py`:
+- `HealthModel` — pure Python, zero HA imports, fully serialisable
+  (`to_dict`/`from_dict`), unit-tested standalone in `tests/test_health.py`.
+  Owns: mode gate (`classify_mode` — DHW dp2052==8 wins > passive cooling
+  dp2051==9 > SH needs modulation>1 & program not in
+  HEALTH_EXCLUDED_PROGRAMS; unseen program never blocks), `_DayAccumulator`
+  (left-Riemann thermal integration over compressor-running samples, gap cap
+  HEALTH_MAX_GAP_S=900 s so restarts/outages never create energy, counter
+  first/last endpoints + reset detection, flow-vs-heat-gen >3 °C ⇒ suspect),
+  day qualification with explicit reject reasons, baseline → z → ridge-
+  regularised 2×2 Σ → analytic T², statuses, sustained-alert run, YoY anchor,
+  confidence metric.
+- `HealthTracker` — HA glue: 5-min `async_track_time_interval` tick (no-op
+  while disconnected), builds a `Sample` from the coordinator, own `Store`
+  (`{DOMAIN}_{entry_id}_health`), debounced 30 s saves + final save on stop,
+  dispatches `health_signal`. Created in `__init__.py` and attached as
+  `coordinator.health_tracker` BEFORE the sensor platform is forwarded;
+  stopped in `async_unload_entry` before the coordinator.
+
+Key statistical decisions (rationale in AUDIT_v0.3.2.md):
+- "elevated" = empirical 95th percentile of the window's own T², with the
+  trailing HEALTH_ALERT_RUN_DAYS excluded from the percentile pool
+  (**self-masking guard** — a sustained fault must not lift its own
+  threshold; found by test).
+- "high" = parametric Hotelling limit, closed-form F(2, n−2) quantile:
+  `f_quantile_df1_2(q,d) = (d/2)((1−q)^(−2/d) − 1)` — no SciPy. The naive
+  empirical 99th percentile at n≈90 is meaningless (interpolates the top
+  two order statistics).
+- HEALTH_ETA_PLAUSIBLE = (0.08, 0.85): whole-unit PF ÷ WATER-side Carnot at
+  this installation's ~13.5 K lift ⇒ healthy η ≈ 0.18; a 25 % degradation
+  (≈0.13) must stay INSIDE the band to be flagged rather than rejected.
+  Calibrated by the end-to-end simulation in tests/test_health.py. Do not
+  "fix" it back to the literature's 0.4–0.6 (refrigerant-side reference).
+- `eta_yoy_delta`: season-matched year-over-year mean-η delta (365-day
+  offset, ±21-day tolerance, needs ≥30 prior-season days) — the
+  NON-adaptive anchor; the rolling baseline alone tracks-and-hides slow
+  drift. Note: the trailing-90-*qualifying*-day window straddles the summer
+  gap at season start (mixes ~30 old-season days) — deliberate, gives
+  autumn an immediate baseline.
+- Confidence (Health Confidence sensor) = 100 × maturity(n/90) ×
+  (0.30·resolution + 0.30·yield + 0.20·sensor_consistency +
+  0.20·conditioning). Data certainty, NOT health level.
+
+Entities (sensor.py): `HovalHealthIndexSensor` (T² + full attrs),
+`HovalHealthStatusSensor` (ENUM: normal/elevated/high/insufficient_baseline/
+insufficient_mode_data), `HovalHealthConfidenceSensor` (%). All push on
+`health_signal`, available whenever the tracker exists (independent of the
+TCP connection — they render stored statistics). Diagnostics gained a
+"health" block (latest, confidence, last 14 day-records).
+
+---
+
 ## Restart persistence (coordinator.py, v0.3.0)
 
 ```python
@@ -178,18 +248,6 @@ self._restored_dpids: set[int] = set()
   and drops the dp_id from `_restored_dpids` (live data always wins).
 - A corrupt/missing store logs a warning and returns — never blocks startup.
 
-## Electric heater detection (coordinator.electric_heater_on)
-
-```python
-heater_on = (status_ww == 8 and dhw < dhw_sp
-             and heat_gen <= dhw + 5.0
-             and modulation <= 1.0)   # DHW priority: running compressor = HP charging tank
-```
-Returns None until all four temp/status DpIds received. DHW-priority by design:
-while charging, a running compressor is itself heating the tank, so the Heizstab
-is off; it only finishes once the compressor stops. Recomputed on updates to
-status_ww / dhw / dhw_sp / heat_gen / modulation.
-Rated power from `entry.options["heater_power_kw"]` (default 3.0 kW).
 
 ---
 
@@ -204,8 +262,12 @@ config_flow.py   ConfigFlow (IP+port); OptionsFlow (heater, cooling [legacy],
 coordinator.py   TCP reader; frame parser; signals; Store-backed restart
                  persistence (v0.3.0); cop / heater_power_kw / source_temp_c /
                  approach_k_c (v0.3.1) / brine_pump_kw / heating_pump_kw /
-                 standby_kw / heat_pump_active / pumps_active properties
+                 standby_kw / heat_pump_active / pumps_active properties;
+                 v0.3.2 hot-path caches (_dp_signal memo, _BE_VLEN table)
+health.py        v0.3.2 — HealthModel (pure statistics) + HealthTracker
+                 (5-min sampler, own Store, health_signal)
 sensor.py        HovalSensor, HovalPersistentSensor, HovalDynamicCOPSensor,
+                 HovalHealthIndexSensor/StatusSensor/ConfidenceSensor (v0.3.2),
                  HovalElectricHeaterPowerSensor, HovalElectricHeaterEnergySensor,
                  HovalPassiveCoolingPowerSensor/EnergySensor (legacy, v0.3.0),
                  HovalHeatPumpElecPowerSensor, HovalHeatPumpElecEnergySensor,
@@ -226,6 +288,8 @@ strings.json / translations/en.json   Options UI (7 fields as of v0.3.1)
 - `hoval_can_{entry_id}_cooling` — passive-cooling on/off change (also used
   as the recompute trigger for `pumps_active`-dependent sensors, v0.3.0)
 - `hoval_can_{entry_id}_connection` — TCP connected/disconnected
+- `hoval_can_{entry_id}_health` — health model updated (every processed
+  5-min sample; entities re-render state + attributes) (v0.3.2)
 
 ---
 
@@ -271,8 +335,19 @@ strings.json / translations/en.json   Options UI (7 fields as of v0.3.1)
    a more robust passive-cooling detection than the current single-status read.
 
 ## Tests
-`python3 tests/test_protocol.py` — standalone (stubs HA, including a
-functional in-memory `Store` stub), exit 0 == pass.
+`python3 tests/test_protocol.py` and `python3 tests/test_health.py` — both
+standalone (stub HA, including a functional in-memory `Store` stub),
+exit 0 == pass.
+
+test_health.py (v0.3.2) covers: the closed-form F(2,d) quantile (converges
+to χ²₂/2), the mode gate, day aggregation (thermal integration, Carnot
+cross-check, gap capping), every qualification/rejection path, baseline →
+T² → status incl. the ridge path and the self-masking percentile guard, a
+45-day end-to-end simulation through 5-min samples with a 1 kWh-quantised
+electrical counter plus an injected degradation, the YoY anchor, confidence
+monotonicity, and the to_dict/from_dict round-trip. test_protocol.py gained
+a health-tracker glue group (tick→sample→store→signal, disconnected no-op,
+tracker restart round-trip).
 Covers COP points (v0.3.1: anchor k-invariance, k=0 legacy equivalence,
 blend continuity/monotonicity, defaults src=16.5/k=7, guard/clamp edges),
 numeric decode, adversarial framing, watchdog, integrators incl. the

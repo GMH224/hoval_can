@@ -22,9 +22,11 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from .const import (
     DOMAIN, PERSISTENT_DPIDS, SENSOR_DESCRIPTIONS,
     DP_HEAT_GEN, DP_MODULATION, DP_THERMAL_POWER,
-    connection_signal, cooling_signal, dp_signal, heater_signal,
+    connection_signal, cooling_signal, dp_signal, health_signal,
+    heater_signal,
 )
 from .coordinator import HovalCANCoordinator
+from .health import HEALTH_STATUS_OPTIONS, STATUS_INSUFF_BASELINE
 
 _LOGGER = logging.getLogger(__name__)
 _ENERGY_INTERVAL = timedelta(seconds=60)
@@ -53,6 +55,12 @@ async def async_setup_entry(
         HovalStandbyPowerSensor(coord, entry),
         HovalTotalElecPowerSensor(coord, entry),
         HovalTotalElecEnergySensor(coord, entry),
+        # Health index (v0.3.2) — daily self-referential Hotelling-T² fusion
+        # of measured cycling rate and measured Gütegrad, plus a data-
+        # confidence companion. Tracker is created in __init__.py.
+        HovalHealthIndexSensor(coord, entry),
+        HovalHealthStatusSensor(coord, entry),
+        HovalHealthConfidenceSensor(coord, entry),
         # Diagnostic telemetry (promoted from connectivity-sensor attributes
         # to first-class, recordable/alarmable entities).
         HovalDataAgeSensor(coord, entry),
@@ -966,6 +974,169 @@ class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
 
 
 # ── Diagnostic telemetry ───────────────────────────────────────────────────
+
+# ── Health index (v0.3.2) ──────────────────────────────────────────────────
+
+class HovalHealthBaseSensor(SensorEntity):
+    """Base for the health entities.
+
+    State is derived from the HealthTracker's stored daily statistics, not
+    from the live TCP stream — so these stay available (and meaningful)
+    while the gateway is disconnected, like the diagnostic sensors. Updates
+    are pushed via health_signal after every processed 5-minute sample.
+    The tracker is attached to the coordinator by __init__.py before the
+    sensor platform is forwarded, so it is always present here.
+    """
+    _attr_has_entity_name = True
+    _attr_should_poll     = False
+
+    def __init__(self, coord: HovalCANCoordinator, entry: ConfigEntry) -> None:
+        self._coord = coord
+        self._entry = entry
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def available(self) -> bool:
+        return getattr(self._coord, "health_tracker", None) is not None
+
+    @property
+    def _model(self):
+        tracker = getattr(self._coord, "health_tracker", None)
+        return tracker.model if tracker is not None else None
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, health_signal(self._entry.entry_id),
+                self._update,
+            )
+        )
+        self._update()
+
+    @callback
+    def _update(self) -> None:
+        self.async_write_ha_state()
+
+
+class HovalHealthIndexSensor(HovalHealthBaseSensor):
+    """Hotelling-T² health index for the latest qualifying day.
+
+    Unbounded and meaningful ONLY relative to this unit's own history —
+    no absolute 0-100 score exists for this installation (spec §11).
+    Unknown until ≥ 30 qualifying SPACE_HEATING_ACTIVE days are baselined;
+    all model internals are exposed as attributes for dashboards/automation.
+    """
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon        = "mdi:heart-pulse"
+    _attr_suggested_display_precision = 2
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id = f"{entry.entry_id}_health_index"
+        self._attr_name      = "Health Index T2"
+
+    @property
+    def native_value(self):
+        model = self._model
+        if model is None:
+            return None
+        return model.latest.get("t2")
+
+    @property
+    def extra_state_attributes(self):
+        model = self._model
+        if model is None:
+            return None
+        latest = model.latest
+        return {
+            "status": latest.get("status"),
+            "z_cycle": latest.get("z_cycle"),
+            "z_eta": latest.get("z_eta"),
+            "cycle_rate_per_day": latest.get("cycle_rate"),
+            "guetegrad_eta": latest.get("eta"),
+            "daily_performance_factor": latest.get("pf"),
+            "daily_carnot_cop": latest.get("carnot"),
+            "baseline_days": latest.get("baseline_n"),
+            "baseline_mu_cycle": latest.get("mu_cycle"),
+            "baseline_mu_eta": latest.get("mu_eta"),
+            "correlation_rho": latest.get("rho"),
+            "ridge_regularized": latest.get("ridged"),
+            "elevated_limit_p95": latest.get("elevated_limit"),
+            "high_limit_f99": latest.get("high_limit"),
+            "consecutive_elevated_days": latest.get("consecutive_elevated"),
+            "sustained_alert": latest.get("sustained_alert"),
+            "eta_yoy_delta": latest.get("eta_yoy_delta"),
+            "last_qualifying_day": latest.get("last_qualifying_day"),
+        }
+
+
+class HovalHealthStatusSensor(HovalHealthBaseSensor):
+    """Categorical health status (spec §11 flag set) as an ENUM entity —
+    normal / elevated / high / insufficient_baseline /
+    insufficient_mode_data. Automation-friendly companion to the T² value."""
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options      = list(HEALTH_STATUS_OPTIONS)
+    _attr_icon         = "mdi:stethoscope"
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id = f"{entry.entry_id}_health_status"
+        self._attr_name      = "Health Status"
+
+    @property
+    def native_value(self):
+        model = self._model
+        if model is None:
+            return None
+        return model.latest.get("status") or STATUS_INSUFF_BASELINE
+
+    @property
+    def extra_state_attributes(self):
+        model = self._model
+        if model is None:
+            return None
+        last = model.history[-1] if model.history else None
+        return {
+            "last_closed_day": last.get("day") if last else None,
+            "last_day_qualifying": last.get("qualifying") if last else None,
+            "last_day_reject_reasons": last.get("reject_reasons") if last else None,
+            "history_days": len(model.history),
+        }
+
+
+class HovalHealthConfidenceSensor(HovalHealthBaseSensor):
+    """Certainty of the health-index DATA (0-100 %) — explicitly NOT a
+    health level. A structurally sound heat pump with a noisy, sparse, or
+    immature data pipeline reads LOW here while Health Status may still
+    read "normal"; treat T² excursions at low confidence as unproven.
+    Component scores are exposed as attributes (see health.py::confidence).
+    """
+    _attr_state_class                = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "%"
+    _attr_icon                       = "mdi:shield-check"
+    _attr_suggested_display_precision = 0
+
+    def __init__(self, coord, entry) -> None:
+        super().__init__(coord, entry)
+        self._attr_unique_id = f"{entry.entry_id}_health_confidence"
+        self._attr_name      = "Health Confidence"
+
+    @property
+    def native_value(self):
+        model = self._model
+        if model is None:
+            return None
+        return model.confidence().get("confidence")
+
+    @property
+    def extra_state_attributes(self):
+        model = self._model
+        if model is None:
+            return None
+        conf = model.confidence()
+        conf.pop("confidence", None)
+        return conf
+
 
 class HovalDiagnosticSensor(SensorEntity):
     """Base for polled diagnostic entities.

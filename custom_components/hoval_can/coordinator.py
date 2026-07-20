@@ -45,6 +45,15 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# v0.3.2 optimisation (behaviour-neutral): value-field byte length for BE
+# frames precomputed once per process. STR and unmapped datapoints are absent
+# → .get() returns None, matching the previous per-frame branch chain exactly.
+_BE_VLEN: dict[int, int] = {
+    dp_id: TBYTES[desc.typename]
+    for dp_id, desc in SENSOR_BY_DPID.items()
+    if desc.typename != "STR" and desc.typename in TBYTES
+}
+
 
 def _windowed_rate(samples, current_value: int, now: float,
                    window_s: float, min_elapsed_s: float):
@@ -78,9 +87,19 @@ class HovalCANCoordinator:
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass        = hass
         self._entry      = entry
+        self._entry_id: str = entry.entry_id
         self._host: str  = entry.data["host"]
         self._port: int  = entry.data.get("port", DEFAULT_PORT)
         self._data: dict[int, Any] = {}
+        # ── Hot-path caches (v0.3.2 optimisation — behaviour-neutral) ──────
+        # dp_signal() builds an f-string; _update_dp runs for every decoded
+        # frame (~every 2 s, plus replay bursts), so the per-dpid signal
+        # string is memoised. The derived-state signal strings are computed
+        # once. Proven equivalent by the unchanged v0.3.1 test suite.
+        self._dp_signal_cache: dict[int, str] = {}
+        self._heater_signal: str = heater_signal(self._entry_id)
+        self._cooling_signal: str = cooling_signal(self._entry_id)
+        self._connection_signal: str = connection_signal(self._entry_id)
         self._connected  = False
         self._task: asyncio.Task | None = None
         self._stop       = False
@@ -295,7 +314,7 @@ class HovalCANCoordinator:
     def decoded_rate_per_min(self) -> float | None:
         """Decoded datapoints per minute over a sliding 60-min window."""
         per_s = _windowed_rate(
-            [(t, d) for (t, _e, d) in self._rate_samples],
+            ((t, d) for (t, _e, d) in self._rate_samples),
             self._decoded_count, time.monotonic(),
             THROUGHPUT_WINDOW_S, RATE_MIN_ELAPSED_S,
         )
@@ -305,7 +324,7 @@ class HovalCANCoordinator:
     def framing_error_rate_per_h(self) -> float | None:
         """Framing errors per hour over a sliding 15-min window."""
         per_s = _windowed_rate(
-            [(t, e) for (t, e, _d) in self._rate_samples],
+            ((t, e) for (t, e, _d) in self._rate_samples),
             self._framing_errors, time.monotonic(),
             ERROR_RATE_WINDOW_S, RATE_MIN_ELAPSED_S,
         )
@@ -476,13 +495,13 @@ class HovalCANCoordinator:
         next CAN broadcast of an unchanged value.
         """
         for dp_id in self._restored_dpids:
-            async_dispatcher_send(self.hass, dp_signal(self._entry.entry_id, dp_id))
+            async_dispatcher_send(self.hass, self._dp_signal(dp_id))
         if self._restored_dpids & {
             DP_STATUS_WW, DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_HEAT_GEN, DP_MODULATION,
         }:
-            async_dispatcher_send(self.hass, heater_signal(self._entry.entry_id))
+            async_dispatcher_send(self.hass, self._heater_signal)
         if DP_STATUS_HC in self._restored_dpids or DP_STATUS_HP in self._restored_dpids:
-            async_dispatcher_send(self.hass, cooling_signal(self._entry.entry_id))
+            async_dispatcher_send(self.hass, self._cooling_signal)
 
     def _persist_snapshot(self) -> dict[str, Any]:
         return {
@@ -654,10 +673,7 @@ class HovalCANCoordinator:
         if cmd == CMD_READ_RESP_LE:
             return 3            # 1 skipped byte (0x00) + 2 data bytes
         if cmd == CMD_READ_RESP_BE:
-            desc = SENSOR_BY_DPID.get(dp_id)
-            if desc is None or desc.typename == "STR":
-                return None
-            return TBYTES.get(desc.typename)
+            return _BE_VLEN.get(dp_id)   # None for STR / unmapped (v0.3.2)
         return None
 
     def _consume_frames(self, buf: bytes) -> bytes:
@@ -757,11 +773,18 @@ class HovalCANCoordinator:
         if value is not None:
             self._update_dp(dp_id, value)
 
+    def _dp_signal(self, dp_id: int) -> str:
+        """Memoised dp_signal string (hot path — one call per decoded frame)."""
+        sig = self._dp_signal_cache.get(dp_id)
+        if sig is None:
+            sig = self._dp_signal_cache[dp_id] = dp_signal(self._entry_id, dp_id)
+        return sig
+
     def _update_dp(self, dp_id: int, value: Any) -> None:
         self._data[dp_id] = value
         self._last_data_mono = time.monotonic()   # feeds the data watchdog
         self._decoded_count += 1
-        async_dispatcher_send(self.hass, dp_signal(self._entry.entry_id, dp_id))
+        async_dispatcher_send(self.hass, self._dp_signal(dp_id))
 
         if dp_id in PERSISTENT_DPIDS:
             # Live data always takes precedence over anything restored; a
@@ -775,24 +798,18 @@ class HovalCANCoordinator:
             new_state = self.electric_heater_on
             if new_state != self._heater_on:
                 self._heater_on = new_state
-                async_dispatcher_send(
-                    self.hass, heater_signal(self._entry.entry_id)
-                )
+                async_dispatcher_send(self.hass, self._heater_signal)
 
         if dp_id == DP_STATUS_HC:
             new_cooling = self.passive_cooling_on
             if new_cooling != self._cooling_on:
                 self._cooling_on = new_cooling
-                async_dispatcher_send(
-                    self.hass, cooling_signal(self._entry.entry_id)
-                )
+                async_dispatcher_send(self.hass, self._cooling_signal)
 
     def _set_connected(self, state: bool) -> None:
         if state != self._connected:
             self._connected = state
-            async_dispatcher_send(
-                self.hass, connection_signal(self._entry.entry_id)
-            )
+            async_dispatcher_send(self.hass, self._connection_signal)
 
 
 # ── Numeric decoder (module-level for clarity) ────────────────────────────

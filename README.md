@@ -1,7 +1,7 @@
 # Hoval CAN — Home Assistant Integration
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz)
-![Version](https://img.shields.io/badge/version-0.3.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.2-blue)
 ![HA min version](https://img.shields.io/badge/HA-2023.1%2B-green)
 
 Local-push integration for Hoval heat pump systems with the **WLAN Gateway**. Connects to the proprietary CAN-BUS TCP stream on port 3113. No cloud, no Modbus module required. Strictly **read-only** — nothing is ever written to the bus.
@@ -46,7 +46,7 @@ COP is **not** configurable — it is calculated automatically from live sensor 
 
 ## Entities
 
-### Sensors (56)
+### Sensors (59)
 
 #### Temperatures (7)
 `outdoor_temp`, `room_temp`, `flow_temp`, `dhw_temp`, `heat_gen_temp`, `solar_storage_temp`\*, `circulation_temp`\*
@@ -78,6 +78,15 @@ COP is **not** configurable — it is calculated automatically from live sensor 
 
 #### Hardware Counter (1)
 `sensor.hoval_can_total_wez_electrical_energy` (MWh, from device — persistent)
+
+#### Health Index (3) — new in v0.3.2
+| Entity | Unit | Notes |
+|---|---|---|
+| `sensor.hoval_can_health_index_t2` | — | Hotelling-T² statistic for the latest qualifying day; model internals (z-scores, PF, Gütegrad η, baseline stats, limits, YoY drift) exposed as attributes |
+| `sensor.hoval_can_health_status` | enum | `normal` / `elevated` / `high` / `insufficient_baseline` / `insufficient_mode_data` |
+| `sensor.hoval_can_health_confidence` | % | Certainty of the health **data** (0–100 %) — *not* a health level. Component breakdown in attributes |
+
+See **Heat Pump Health Index** below for methodology and expected behaviour.
 
 #### Status, Setpoints, Modes, Firmware extensions
 See entity registry after installation.
@@ -243,6 +252,104 @@ Add individually under **Settings → Energy → Individual devices**:
 
 ---
 
+## Heat Pump Health Index — new in v0.3.2
+
+A daily, self-referential statistical health model for the compressor and
+refrigerant circuit. There are **no absolute thresholds** anywhere in it —
+Hoval publishes no field-level health limits for this unit, so the only
+honest reference is the machine's own history.
+
+### The two features (measured only)
+
+| Feature | Source | What it catches |
+|---|---|---|
+| **CycleRate(day)** = Δ `wez_switch_cycles` (DpId 2080) | hardware counter | Short-cycling: control instability, load mismatch, refrigerant/valve faults. Wear-relevant even when the energy penalty is small |
+| **Gütegrad η(day)** = PF(day) / mean COP_carnot(day) | measured | Efficiency degradation: fouled exchangers, refrigerant loss, compressor wear |
+
+where **PF(day)** = ∫ Current Heating Power (DpId 29051) dt ÷ Δ Total WEZ
+Electrical Energy (hardware counter DpId 23009, 1 kWh resolution), and
+**COP_carnot** = T_flow[K] / (T_flow − T_source) per 5-minute space-heating
+sample (flow temperature DpId 2, cross-checked against the heat-generator
+temperature DpId 7 — divergence > 3 °C marks the sample sensor-suspect).
+
+> **Why the live "Heat Pump COP" sensor is *not* an input:** that entity is a
+> *model* of modulation and temperatures — it contains no measured electrical
+> quantity. A health index built on it would divide one temperature model by
+> another and could never move when the machine actually degrades. The health
+> model deliberately uses only hardware counters and measured temperatures.
+
+> **Why η ≈ 0.2 and not the textbook 0.4–0.6:** literature Gütegrad values
+> reference the refrigerant-side lift. This η divides a *whole-unit* daily PF
+> (pumps + standby are inside Δ23009) by the pure *water-side* Carnot COP —
+> which at this installation's small floor-heating lift (~13.5 K →
+> COP_carnot ≈ 22) yields healthy values near 0.18. Only the *relative*
+> position vs. the unit's own baseline matters.
+
+### Day qualification ("purity days")
+
+DpId 2080 counts starts of the whole heat generator without a mode tag, so
+cycles are attributed by using only days that are almost purely space
+heating. A day enters the baseline only if **all** hold: ≥ 12 h of observed
+telemetry; ≥ 2 h SPACE_HEATING_ACTIVE; DHW + passive-cooling share < 5 %
+(real status datapoints: DpId 2052 == 8, DpId 2051 == 9); electric heater
+never detected; Δ23009 ≥ 5 kWh (1 kWh counter quantisation); both counters
+monotone; ≥ 6 valid Carnot samples with < 50 % sensor-suspect; η inside the
+plausibility band (0.08–0.85). Rejected days are recorded with their reasons
+(visible on the Health Status attributes and in diagnostics) — never fudged.
+
+### Fusion and statuses
+
+Each qualifying day's (CycleRate, η) is standardised against the trailing
+**90 qualifying days** (minimum 30) and fused with **Hotelling's T²** using
+the baseline's own 2×2 covariance (ridge-regularised if near-singular — the
+two features are physically correlated). Statuses:
+
+- **normal** — T² at or below the baseline's empirical 95th percentile. The
+  percentile pool excludes the trailing 5 days being judged, so a genuine
+  sustained fault cannot raise its own alarm threshold.
+- **elevated** — above the 95th percentile. `sustained_alert` goes true after
+  ≥ 5 *consecutive* elevated days (single spikes are cold snaps, not faults).
+- **high** — above the parametric Hotelling-T² control limit (closed-form
+  F(2, n−2) quantile at 99 %).
+- **insufficient_baseline** — fewer than 30 qualifying days yet.
+- **insufficient_mode_data** — no qualifying day in 14 days (summer).
+
+The rolling baseline adapts weekly, which also means it *tracks* slow
+degradation — so the index additionally exposes **`eta_yoy_delta`**: the
+current mean η minus the same season's mean one year earlier. That is the
+deliberately non-adaptive anchor that makes multi-month drift visible.
+
+### Health Confidence (the companion sensor)
+
+`sensor.hoval_can_health_confidence` answers a different question: **how much
+should you trust the index itself?** A health sensor showing white noise is
+worthless — this sensor makes that visible instead of hiding it.
+
+`confidence = 100 × maturity × (0.30·resolution + 0.30·yield + 0.20·sensor + 0.20·conditioning)`
+
+| Component | Meaning |
+|---|---|
+| `maturity` | qualifying-day count vs. the full 90-day window — hard gate |
+| `resolution` | median daily Δ23009 vs. the 1 kWh counter quantisation (full score at ≥ 20 kWh/day) |
+| `yield` | fraction of the last 14 closed days that qualified |
+| `sensor_consistency` | 1 − mean sensor-suspect fraction |
+| `conditioning` | numerical stability of Σ⁻¹ (penalised once |ρ| > 0.9) |
+
+Read them together: a T² excursion at 25 % confidence is a data problem
+until proven otherwise; the same excursion at 85 % confidence deserves a
+look at the machine.
+
+### What to expect on this installation
+
+Installed mid-summer, the status will read `insufficient_mode_data` /
+`insufficient_baseline` until the heating season delivers ~30 qualifying
+days — **the first real index is expected around November**, with confidence
+rising toward its ceiling as the 90-day window fills over the winter. All
+state survives restarts (own Store, debounced writes); connection outages
+are never integrated into a day's energy or time.
+
+---
+
 ## Electric Heater Detection
 
 The Heizstab has no direct CAN-BUS datapoint. Detected as ON when:
@@ -289,6 +396,33 @@ Live CAN data always overwrites a restored value the moment it arrives. A corrup
 ---
 
 ## Changelog
+
+### v0.3.2 — Heat-pump health index (measured, self-referential) + confidence
+- **New entities:** Health Index T2, Health Status (enum), Health Confidence
+  (%). Daily fusion of measured cycling rate (Δ DpId 2080) and measured
+  Gütegrad η (∫29051 dt ÷ Δ23009, over water-side Carnot) via Hotelling's T²
+  against the unit's own 90-day baseline — no absolute thresholds, no
+  synthetic COP anywhere in the model. See "Heat Pump Health Index".
+- **Health Confidence** quantifies certainty of the health *data* (baseline
+  maturity, counter quantisation, qualifying-day yield, sensor consistency,
+  covariance conditioning) — a noisy or immature index reads low confidence
+  instead of pretending to be signal.
+- New `health.py` module: pure statistical core (standalone-testable) + HA
+  tracker (5-min sampling, own Store, debounced persistence, restart-safe,
+  outage gaps never integrated). Health snapshot added to downloadable
+  diagnostics.
+- DpId 2080 (WEZ Switch Cycles) added to restart persistence so the health
+  sampler has it immediately after a restart.
+- **Optimisations (behaviour-neutral, proven by the unchanged v0.3.1 test
+  suite):** memoised dispatcher-signal strings on the frame hot path;
+  precomputed BE value-length table in the parser; generator-based rate
+  windows.
+- Tests: new `tests/test_health.py` (F-quantile closed form, mode gate, day
+  aggregation, every rejection path, T²/status incl. ridge + self-masking
+  guard, 45-day end-to-end simulation with 1 kWh-quantised counter, YoY
+  anchor, confidence monotonicity, persistence round-trip) plus a
+  health-tracker glue group in `tests/test_protocol.py`.
+- Full audit: `AUDIT_v0.3.2.md`.
 
 ### v0.3.1 — COP model refinement (approach-k, regime blend), integrator re-sampling
 - **New option: COP Approach Temperature k** (default 7.0 °C, range 0–15 °C).

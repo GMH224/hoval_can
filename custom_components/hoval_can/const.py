@@ -171,6 +171,10 @@ DP_STATUS_HP       = 2053    # Heat Pump Status        U8
 DP_HEAT_GEN        = 7       # Wärmeerzeuger-Ist     S16 dec=1 °C  ← COP input
 DP_THERMAL_POWER   = 29051   # Current Heating Power U32 dec=1 kW
 DP_MODULATION      = 20052   # Compressor Modulation U8  %         ← COP input
+DP_FLOW_TEMP       = 2       # Vorlauf-Ist           S16 dec=1 °C  ← health T_sink
+DP_WEZ_ELEC_TOTAL  = 23009   # Hardware lifetime electricity  U32 dec=3 MWh
+DP_WEZ_CYCLES      = 2080    # WEZ Switch Cycles     U32 counter   ← health input
+DP_HEATING_PROGRAM = 502     # Active Heating Program STR          ← health gate
 
 DHW_STATUS_CHARGING = 8
 HC_STATUS_PASSIVE_COOLING = 9   # status_heating_circuit value for passive cooling
@@ -294,6 +298,76 @@ def calculate_cop(
     return max(COP_CLAMP_MIN, min(COP_CLAMP_MAX, round(cop, 4)))
 
 
+# ── Health index (v0.3.2) ──────────────────────────────────────────────────
+# Self-referential heat-pump health model. Two MEASURED daily features fused
+# with Hotelling's T² against the unit's own rolling baseline:
+#
+#   CycleRate(day) = Δ DpId 2080 (WEZ Switch Cycles, hardware counter)
+#   η(day)         = PF(day) / mean COP_carnot(day)          ("Gütegrad")
+#     PF(day)      = ∫ DpId 29051 (thermal kW) dt  /  Δ DpId 23009 (kWh)
+#     COP_carnot   = T_flow[K] / (T_flow − T_source)   per SH sample
+#
+# Design invariants (see AUDIT_v0.3.2 §"Model provenance"):
+#   • ONLY measured CAN datapoints enter the model — the synthetic
+#     calculate_cop() output is deliberately NOT an input (it contains no
+#     measured electrical quantity, so η built on it would be circular).
+#   • Mode gate uses real status datapoints: DHW via DpId 2052 == 8,
+#     passive cooling via DpId 2051 == 9 (NOT the derived cooling-energy
+#     estimate, which is a configured plug value).
+#   • No fixed absolute thresholds — "elevated" is the baseline's own
+#     empirical 95th percentile; "high" is the parametric Hotelling-T²
+#     control limit (closed-form F quantile for p = 2). Hoval publishes no
+#     field-level health thresholds for this unit; absolute numbers would
+#     be fabricated.
+#   • Δ DpId 23009 is quantised to 1 kWh — days below HEALTH_MIN_ELEC_KWH
+#     are rejected rather than divided into noise.
+HEALTH_SAMPLE_INTERVAL_S   = 300    # s between telemetry samples (5 min)
+HEALTH_MAX_GAP_S           = 900    # s — longer sample gaps are not integrated
+                                    # (restart / outage must not create energy)
+HEALTH_MIN_COVERAGE_S      = 12 * 3600  # observed seconds for a day to count
+HEALTH_MIN_SH_S            = 2 * 3600   # min SPACE_HEATING_ACTIVE time per day
+HEALTH_PURITY_MAX          = 0.05   # (DHW+cooling)/observed — spec §4 "purity"
+HEALTH_MIN_ELEC_KWH        = 5.0    # min daily Δ23009 vs 1 kWh quantisation
+HEALTH_MIN_CARNOT_SAMPLES  = 6      # min valid SH samples for a daily Carnot mean
+HEALTH_TSINK_XCHECK_MAX_C  = 3.0    # |flow − heat_gen| beyond this → suspect
+HEALTH_MAX_SUSPECT_FRAC    = 0.5    # reject day if most SH samples suspect
+HEALTH_ETA_PLAUSIBLE       = (0.08, 0.85)  # Gütegrad plausibility band.
+# NOTE the floor is far below the literature's 0.4-0.6 "Gütegrad" range on
+# purpose: literature values reference the refrigerant-side lift, while this
+# η divides a WHOLE-UNIT daily PF (pumps + standby in Δ23009) by the pure
+# WATER-side Carnot COP — which at this installation's small floor-heating
+# lift (~13.5 K → COP_carnot ≈ 22) yields healthy values near 0.18. A 25 %
+# efficiency loss must land INSIDE the band (≈ 0.13) so degradation is
+# flagged by the T² model, not rejected as bad data; only pipeline-grade
+# implausibility (η < 0.08, e.g. PF < 2 at this lift) is excluded.
+# Calibrated by the end-to-end simulation in tests/test_health.py.
+HEALTH_BASELINE_WINDOW     = 90     # qualifying days in the rolling baseline
+HEALTH_BASELINE_MIN        = 30     # min qualifying days before an index exists
+HEALTH_SIGMA_FLOOR         = 1e-6   # σ floor — degenerate baselines never div/0
+HEALTH_RIDGE_EPS           = 0.01   # Σ + εI when near-singular (spec §8)
+HEALTH_ELEVATED_PCTL       = 0.95   # empirical percentile → "elevated"
+HEALTH_HIGH_F_Q            = 0.99   # F quantile → parametric "high" limit
+HEALTH_ALERT_RUN_DAYS      = 5      # consecutive elevated days → sustained alert
+HEALTH_STALE_MODE_DAYS     = 14     # no qualifying day in this many days
+                                    # → insufficient_mode_data (e.g. summer)
+HEALTH_HISTORY_MAX_DAYS    = 400    # stored day records (enables YoY anchor)
+HEALTH_YOY_TOLERANCE_DAYS  = 21     # centre-match slack for the YoY window
+HEALTH_STORE_SUFFIX        = "health"   # Store key suffix
+# Heating-program strings that exclude SPACE_HEATING_ACTIVE (spec §3 —
+# "Summer"/idle programs). Matched case-insensitively as substrings; an
+# unseen program datapoint never blocks classification.
+HEALTH_EXCLUDED_PROGRAMS   = ("sommer", "summer", "standby", "aus")
+
+# Confidence-sensor component weights (data certainty, NOT health level).
+# confidence = 100 × maturity × Σ(wᵢ · componentᵢ); see health.py.
+HEALTH_CONF_W_RESOLUTION   = 0.30   # daily elec delta vs 1 kWh quantisation
+HEALTH_CONF_W_YIELD        = 0.30   # qualifying-day yield over recent days
+HEALTH_CONF_W_SENSOR       = 0.20   # 1 − sensor-suspect fraction
+HEALTH_CONF_W_CONDITION    = 0.20   # Σ conditioning (|ρ| near 1 → T² unstable)
+HEALTH_CONF_ELEC_FULL_KWH  = 20.0   # Δ23009 ≥ this → full resolution score
+HEALTH_CONF_YIELD_WINDOW   = 14     # days over which yield is measured
+
+
 # ── Dispatcher signal builders ─────────────────────────────────────────────
 def dp_signal(entry_id: str, dp_id: int) -> str:
     return f"{DOMAIN}_{entry_id}_dp_{dp_id}"
@@ -306,6 +380,9 @@ def cooling_signal(entry_id: str) -> str:
 
 def connection_signal(entry_id: str) -> str:
     return f"{DOMAIN}_{entry_id}_connection"
+
+def health_signal(entry_id: str) -> str:
+    return f"{DOMAIN}_{entry_id}_health"
 
 
 # ── Sensor descriptions ───────────────────────────────────────────────────
@@ -451,7 +528,8 @@ SENSOR_BY_DPID: dict[int, HovalSensorDescription] = {
 # coordinator, to seed internal state from HA's Store before any CAN data
 # has arrived — see HovalCANCoordinator._async_load_persisted().
 PERSISTENT_DPIDS: frozenset[int] = frozenset({
-    23009,
+    DP_WEZ_ELEC_TOTAL,
+    DP_WEZ_CYCLES,      # v0.3.2 — health sampler needs cycles right after restart
     DP_STATUS_HP, DP_STATUS_HC, DP_STATUS_WW,
     DP_MODULATION, DP_HEAT_GEN, DP_THERMAL_POWER,
     DP_DHW_ACTUAL, DP_DHW_SETPOINT,

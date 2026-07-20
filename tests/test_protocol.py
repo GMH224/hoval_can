@@ -31,7 +31,7 @@ import enum
 
 class _SDC(enum.Enum):
     TEMPERATURE = "temperature"; POWER = "power"; ENERGY = "energy"
-    DURATION = "duration"
+    DURATION = "duration"; ENUM = "enum"   # v0.3.2: health status sensor
 
 
 class _SC(enum.Enum):
@@ -943,6 +943,57 @@ def test_rates():
            nv2(S.HovalThroughputSensor, FakeRn()) is None)
 
 
+
+def test_health_tracker():
+    """v0.3.2: HealthTracker glue — tick → Sample → model → Store → signal."""
+    print("Health tracker glue:")
+    import datetime as _dt
+    from hoval_can import health as H
+
+    _FakeStore._backing.clear()
+    _SENT.clear()
+    co = _co()
+    co._connected = True
+    co._data.update({
+        const.DP_STATUS_WW: 0, const.DP_STATUS_HC: 1,
+        const.DP_MODULATION: 40, const.DP_HEATING_PROGRAM: "Heizen Woche 1",
+        const.DP_FLOW_TEMP: 30.0, const.DP_HEAT_GEN: 30.4,
+        const.DP_THERMAL_POWER: 3.5, const.DP_WEZ_ELEC_TOTAL: 5.0,
+        const.DP_WEZ_CYCLES: 1000,
+    })
+    tr = H.HealthTracker(types.SimpleNamespace(loop=None), _Entry(), co)
+    asyncio.run(tr.async_start())
+    expect("starts with empty model", len(tr.model.history) == 0)
+
+    t0 = _dt.datetime(2026, 1, 10, 12, 0, tzinfo=_dt.timezone.utc)
+    tr._tick(t0)
+    tr._tick(t0 + _dt.timedelta(minutes=5))
+    acc = tr.model._acc
+    expect("samples accumulated into open day",
+           acc is not None and acc.sh_sample_n == 2
+           and abs(acc.mode_s[H.MODE_SH] - 300.0) < 1.0)
+    expect("health signal dispatched",
+           any(s.endswith("_health") for s in _SENT))
+    key = f"hoval_can_e1_{const.HEALTH_STORE_SUFFIX}"
+    expect("state persisted to health store",
+           key in _FakeStore._backing
+           and _FakeStore._backing[key].get("acc") is not None)
+
+    # Disconnected → tick is a no-op (no phantom samples during outages).
+    co._connected = False
+    tr._tick(t0 + _dt.timedelta(minutes=10))
+    expect("no sample while disconnected", tr.model._acc.sh_sample_n == 2)
+    co._connected = True
+
+    # Restart round-trip through the tracker store.
+    asyncio.run(tr.async_stop())
+    tr2 = H.HealthTracker(types.SimpleNamespace(loop=None), _Entry(), co)
+    asyncio.run(tr2.async_start())
+    expect("open day survives tracker restart",
+           tr2.model._acc is not None
+           and tr2.model._acc.sh_sample_n == 2)
+
+
 def main():
     test_cop()
     test_decode()
@@ -956,6 +1007,7 @@ def main():
     test_persistence()
     test_diagnostics()
     test_rates()
+    test_health_tracker()
     print()
     print("RESULT:", "ALL PASS" if not _fails else f"{len(_fails)} FAIL: {_fails}")
     sys.exit(1 if _fails else 0)
