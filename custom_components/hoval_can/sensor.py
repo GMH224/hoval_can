@@ -1100,6 +1100,7 @@ class HovalHealthStatusSensor(HovalHealthBaseSensor):
             "last_closed_day": last.get("day") if last else None,
             "last_day_qualifying": last.get("qualifying") if last else None,
             "last_day_reject_reasons": last.get("reject_reasons") if last else None,
+            "last_day_unobserved_h": last.get("unknown_h") if last else None,
             "history_days": len(model.history),
         }
 

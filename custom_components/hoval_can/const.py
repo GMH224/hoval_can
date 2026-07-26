@@ -353,6 +353,56 @@ HEALTH_STALE_MODE_DAYS     = 14     # no qualifying day in this many days
 HEALTH_HISTORY_MAX_DAYS    = 400    # stored day records (enables YoY anchor)
 HEALTH_YOY_TOLERANCE_DAYS  = 21     # centre-match slack for the YoY window
 HEALTH_STORE_SUFFIX        = "health"   # Store key suffix
+
+# ── Cold-start / stale-restore readiness (v0.3.3) ──────────────────────────
+# After a restart the coordinator seeds self._data from its Store for every
+# PERSISTENT_DPIDS entry, and get_value() returns those seeded values
+# indistinguishably from live ones. Integrating them is *worse* than having
+# no data: a stale modulation/thermal pair fabricates heat that was never
+# produced (or misses heat that was), while Δ23009 and Δ2080 are device-side
+# counters that advance regardless of whether HA was listening. The result
+# is a corrupted η paired with a CORRECT cycle rate — precisely the
+# decoupled signature the T² fusion is designed to read as a fault.
+#
+# The coordinator already distinguishes the two cases: _restored_dpids holds
+# every dp_id still seeded from the Store and drops it the moment a live
+# frame arrives (coordinator.is_restored()). The health sampler uses that.
+#
+# Two tiers, because CAN broadcasts only on change and a pure freshness gate
+# would deadlock on a datapoint that legitimately never changes:
+#   FRESH_REQUIRED  — no timeout, ever. These drive mode classification and
+#     the thermal integral, so a stale value is actively corrupting. They
+#     also self-heal within minutes *whenever the machine actually runs*,
+#     which is exactly when they matter; if the machine never runs, samples
+#     stay blind and the day correctly fails to qualify anyway.
+#   SETTLE_REQUIRED — freshness OR a bounded settle window. These are gates,
+#     not integrands: once the window has passed, an un-rebroadcast value is
+#     far more likely genuinely unchanged than stale, and a wrong gate is
+#     lossy (day rejected) rather than corrupting.
+# Counter endpoints are handled separately and ALWAYS require freshness —
+# see _DayAccumulator; a stale endpoint corrupts Δ directly, and a counter
+# that never goes fresh correctly rejects the day via elec_delta_too_small.
+HEALTH_FRESH_REQUIRED      = (DP_MODULATION, DP_THERMAL_POWER)
+HEALTH_SETTLE_REQUIRED     = (DP_STATUS_WW, DP_STATUS_HC, DP_HEAT_GEN)
+HEALTH_SETTLE_S            = 3600   # s — bounded settle window for the above
+
+# Mid-day unobserved time (stale-restore blindness OR a sample gap longer
+# than HEALTH_MAX_GAP_S) beyond which the day is rejected.
+#
+# This is NOT merely a data-quantity rule. Blind time creates a structural
+# numerator/denominator mismatch that no amount of skipping can repair: the
+# thermal integral covers only observed seconds, while Δ23009 is endpoint-
+# based and therefore includes every kWh the machine drew while HA was
+# blind. PF is understated by exactly that energy, so the day must be
+# rejected rather than baselined.
+# Derivation of the bound: qualifying days carry ≥ HEALTH_MIN_ELEC_KWH
+# (5 kWh); holding the induced PF error under ~5 % means the unobserved
+# window must cover < 0.25 kWh, which at a typical ~1.5 kW compressor draw
+# is ~10 minutes.
+# Blindness at the START of a day is not counted — the day's counter
+# endpoints and its thermal integral then both begin at the first observed
+# sample, so they stay mutually consistent and no mismatch exists.
+HEALTH_MAX_UNKNOWN_S       = 600
 # Heating-program strings that exclude SPACE_HEATING_ACTIVE (spec §3 —
 # "Summer"/idle programs). Matched case-insensitively as substrings; an
 # unseen program datapoint never blocks classification.

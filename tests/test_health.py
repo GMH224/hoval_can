@@ -495,10 +495,108 @@ def test_persistence():
            len(H.HealthModel.from_dict({"history": "garbage"}).history) == 0)
 
 
+
+# ── 10. Cold start / stale restore (v0.3.3) ────────────────────────────────
+def test_cold_start():
+    print("Cold start / stale restore:")
+
+    # (a) Blind samples integrate NOTHING but are accounted as unobserved.
+    m = H.HealthModel()
+    m.add_sample(_sample(0, 0, blind=True))
+    for j in range(1, 13):                     # 1 h of blind sampling
+        m.add_sample(_sample(0, j * 300, blind=True))
+    acc = m._acc
+    expect("blind: no thermal energy fabricated", acc.thermal_kwh == 0.0)
+    expect("blind: no mode seconds credited",
+           acc.mode_s[H.MODE_SH] == 0.0 and acc.observed_s == 0.0)
+    expect("blind: no Carnot samples", acc.carnot_n == 0)
+    approx("blind time accounted as unknown", acc.unknown_s, 3600.0, 1.0)
+
+    # (b) Stale counter endpoints are refused even on a non-blind sample.
+    m = H.HealthModel()
+    m.add_sample(_sample(0, 0, elec_mwh=5.0, cycles=100,
+                         elec_fresh=False, cycles_fresh=False))
+    expect("stale elec endpoint not captured", m._acc.elec_first is None)
+    expect("stale cycles endpoint not captured", m._acc.cycles_first is None)
+    m.add_sample(_sample(0, 300, elec_mwh=5.0, cycles=100))
+    expect("fresh endpoint captured once live",
+           m._acc.elec_first == 5.0 and m._acc.cycles_first == 100)
+
+    # (c) THE DEFECT ITSELF. Reproduce the v0.3.2 failure end-to-end: HA is
+    # down 07:00-08:00 while the machine idles, then restarts holding a
+    # stale "compressor at 40 %, 3.5 kW" snapshot for 1 h. Δ23009 is
+    # endpoint-based and unaffected, so pre-fix the day gains ~3.5 kWh of
+    # heat that was never produced → PF and η inflated → the day looks
+    # healthier than it is (and the mirror case fakes a fault).
+    def _restart_day(blind_supported):
+        mm = H.HealthModel()
+        for j in range(84):                    # 00:00-07:00 normal running
+            mm.add_sample(_sample(0, j * 300, elec_mwh=5.0 + j * 0.0001,
+                                  cycles=100))
+        # 07:00-08:00: HA is down entirely (no samples at all).
+        # 08:00-09:00: back up, but modulation/thermal still seeded.
+        for j in range(84, 96):
+            kw = dict(elec_mwh=5.0084 + (j - 84) * 0.0001, cycles=100)
+            if blind_supported:
+                kw["blind"] = True
+            mm.add_sample(_sample(0, j * 300, **kw))
+        for j in range(96, 288):                # 09:00-24:00 healthy again
+            mm.add_sample(_sample(0, j * 300, elec_mwh=5.0096 + (j - 96) * 0.0001,
+                                  cycles=100 + (j - 96) // 48))
+        mm.add_sample(_sample(1, 0, modulation=0.0))
+        return mm.history[0]
+
+    fixed = _restart_day(True)
+    unfixed = _restart_day(False)
+    expect("pre-fix behaviour would have integrated phantom heat",
+           unfixed["thermal_kwh"] > fixed["thermal_kwh"] + 3.0)
+    expect("post-fix day rejected as stale_restore",
+           "stale_restore" in fixed["reject_reasons"])
+    expect("pre-fix day would have silently qualified",
+           "stale_restore" not in unfixed["reject_reasons"])
+    expect("unknown_h reported on the record", fixed["unknown_h"] >= 1.0)
+
+    # (d) A plain outage with NO stale data (HA down, clean resume) is also
+    # caught — the counters advanced while the thermal integral could not.
+    m = H.HealthModel()
+    for j in range(84):
+        m.add_sample(_sample(0, j * 300, elec_mwh=5.0, cycles=100))
+    m.add_sample(_sample(0, 84 * 300 + 3600, elec_mwh=5.002, cycles=101))
+    approx("long gap recorded as unknown", m._acc.unknown_s, 3600.0, 301.0)
+
+    # (e) Short blind burst under the bound must NOT reject the day.
+    m = H.HealthModel()
+    _realistic_day(m, 0, 1000, 5.0)
+    m._acc.unknown_s = 300.0                   # 5 min < HEALTH_MAX_UNKNOWN_S
+    m.add_sample(_sample(1, 0, modulation=0.0))
+    expect("brief blindness tolerated",
+           "stale_restore" not in m.history[0]["reject_reasons"])
+
+    # (f) Blindness at the START of a day is harmless: endpoints and the
+    # thermal integral both begin at the first observed sample.
+    m = H.HealthModel()
+    for j in range(6):
+        m.add_sample(_sample(0, j * 300, blind=True, elec_mwh=5.0,
+                             elec_fresh=False))
+    expect("no endpoint captured while blind", m._acc.elec_first is None)
+    m.add_sample(_sample(0, 6 * 300, elec_mwh=5.0, cycles=100))
+    expect("first observed sample sets the endpoint",
+           m._acc.elec_first == 5.0)
+
+    # (g) Negative clock step still discarded, and NOT counted as unknown.
+    m = H.HealthModel()
+    m.add_sample(_sample(0, 3000))
+    before = m._acc.unknown_s
+    m.add_sample(_sample(0, 600))
+    expect("clock step neither integrated nor charged as unknown",
+           m._acc.unknown_s == before)
+
+
 def main():
     for t in (test_f_quantile, test_mode_gate, test_aggregation,
               test_qualification, test_statistics, test_end_to_end,
-              test_yoy, test_confidence, test_persistence):
+              test_yoy, test_confidence, test_persistence,
+              test_cold_start):
         print()
         t()
     print()

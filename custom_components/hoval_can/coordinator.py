@@ -773,6 +773,19 @@ class HovalCANCoordinator:
         if value is not None:
             self._update_dp(dp_id, value)
 
+    def is_restored(self, dp_id: int) -> bool:
+        """True if this dp_id's value was seeded from the Store at startup
+        and has NOT yet been refreshed by a live CAN frame (v0.3.3).
+
+        get_value() deliberately cannot distinguish the two — restored
+        values exist precisely so the derived power sensors resolve
+        immediately after a restart. Consumers that *integrate* over time
+        (the health model) must not treat a seeded value as an observation,
+        so they ask here. Always False once a live frame has arrived for
+        that dp_id, and False for every dp_id outside PERSISTENT_DPIDS.
+        """
+        return dp_id in self._restored_dpids
+
     def _dp_signal(self, dp_id: int) -> str:
         """Memoised dp_signal string (hot path — one call per decoded frame)."""
         sig = self._dp_signal_cache.get(dp_id)

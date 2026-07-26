@@ -1,6 +1,6 @@
 # CLAUDE.md — Hoval CAN Integration Developer Context
 
-Version 0.3.2. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
+Version 0.3.3. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
 Read-only. TCP port 3113, proprietary CAN-BUS stream.
 Installation: Hoval UltraSource T comfort (13), 2020, R410A, B0/W35 13.3 kW,
 200 m borehole (analog Erdsonde gauges only — no CAN datapoint for brine temp).
@@ -196,6 +196,33 @@ Two layers in `health.py`:
   `coordinator.health_tracker` BEFORE the sensor platform is forwarded;
   stopped in `async_unload_entry` before the coordinator.
 
+Cold-start protection (v0.3.3 — rationale in AUDIT_v0.3.3.md):
+- `coordinator.is_restored(dp_id)` — True while a dp_id is still seeded from
+  the Store and no live frame has arrived. Backed by the pre-existing
+  `_restored_dpids` set (cleared per-dpid in `_update_dp`); the health
+  sampler is its only consumer. `get_value()` deliberately cannot make this
+  distinction — restored values exist so the derived power sensors resolve
+  immediately after a restart.
+- `Sample.blind` ⇒ `add_sample` integrates NOTHING (no thermal, no mode
+  seconds, no Carnot, no counter endpoints) and charges the interval to
+  `_DayAccumulator.unknown_s`. `Sample.elec_fresh` / `cycles_fresh` gate the
+  two hardware-counter endpoints independently, since a stale endpoint
+  corrupts Δ directly.
+- Over-long intervals (> HEALTH_MAX_GAP_S) are also charged to `unknown_s`
+  instead of being silently dropped — v0.3.2's gap cap prevented phantom
+  *integration* but left the resulting numerator/denominator mismatch
+  invisible. Negative steps (clock adjustments) are dropped and NOT charged.
+- Day close rejects `stale_restore` when `unknown_s > HEALTH_MAX_UNKNOWN_S`
+  (600 s). Bound derived from the 5 kWh qualifying minimum: keeping induced
+  PF error under ~5 % means < 0.25 kWh unobserved ≈ 10 min at ~1.5 kW.
+- Two tiers, because CAN broadcasts on change and a pure freshness gate
+  deadlocks on a genuinely unchanging value: HEALTH_FRESH_REQUIRED
+  (modulation, thermal power — no timeout, ever) vs HEALTH_SETTLE_REQUIRED
+  (statuses, heat-gen temp — freshness OR HEALTH_SETTLE_S = 3600 s).
+- Blindness at the START of a day is harmless and uncounted: endpoints and
+  the thermal integral both begin at the first observed sample, so they stay
+  mutually consistent.
+
 Key statistical decisions (rationale in AUDIT_v0.3.2.md):
 - "elevated" = empirical 95th percentile of the window's own T², with the
   trailing HEALTH_ALERT_RUN_DAYS excluded from the percentile pool
@@ -338,6 +365,13 @@ strings.json / translations/en.json   Options UI (7 fields as of v0.3.1)
 `python3 tests/test_protocol.py` and `python3 tests/test_health.py` — both
 standalone (stub HA, including a functional in-memory `Store` stub),
 exit 0 == pass.
+
+test_health.py cold-start group (v0.3.3) reproduces the defect end-to-end:
+the same simulated restart day run with and without the fix, asserting the
+pre-fix path integrates > 3 kWh of phantom heat and qualifies silently while
+the fixed path rejects with `stale_restore`. test_protocol.py gained a
+tracker-level gate test driving a REAL coordinator with a populated
+`_restored_dpids`, covering both tiers.
 
 test_health.py (v0.3.2) covers: the closed-form F(2,d) quantile (converges
 to χ²₂/2), the mode gate, day aggregation (thermal integration, Carnot

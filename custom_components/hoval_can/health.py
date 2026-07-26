@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -41,6 +42,7 @@ from homeassistant.helpers.storage import Store
 
 from .const import (
     DHW_STATUS_CHARGING, DOMAIN,
+    HEALTH_FRESH_REQUIRED, HEALTH_SETTLE_REQUIRED, HEALTH_SETTLE_S,
     DP_FLOW_TEMP, DP_HEAT_GEN, DP_HEATING_PROGRAM, DP_MODULATION,
     DP_STATUS_HC, DP_STATUS_WW, DP_THERMAL_POWER, DP_WEZ_CYCLES,
     DP_WEZ_ELEC_TOTAL, HC_STATUS_PASSIVE_COOLING,
@@ -50,7 +52,8 @@ from .const import (
     HEALTH_CONF_W_RESOLUTION, HEALTH_CONF_W_SENSOR, HEALTH_CONF_W_YIELD,
     HEALTH_CONF_YIELD_WINDOW, HEALTH_ELEVATED_PCTL, HEALTH_ETA_PLAUSIBLE,
     HEALTH_EXCLUDED_PROGRAMS, HEALTH_HIGH_F_Q, HEALTH_HISTORY_MAX_DAYS,
-    HEALTH_MAX_GAP_S, HEALTH_MAX_SUSPECT_FRAC, HEALTH_MIN_CARNOT_SAMPLES,
+    HEALTH_MAX_GAP_S, HEALTH_MAX_SUSPECT_FRAC, HEALTH_MAX_UNKNOWN_S,
+    HEALTH_MIN_CARNOT_SAMPLES,
     HEALTH_MIN_COVERAGE_S, HEALTH_MIN_ELEC_KWH, HEALTH_MIN_SH_S,
     HEALTH_PURITY_MAX, HEALTH_RIDGE_EPS, HEALTH_SAMPLE_INTERVAL_S,
     HEALTH_SIGMA_FLOOR, HEALTH_STALE_MODE_DAYS, HEALTH_STORE_SUFFIX,
@@ -145,6 +148,14 @@ class Sample:
     cycles: int | None              # DpId 2080 (hardware counter)
     source_c: float                 # configured ground-loop temperature
     heater_on: bool | None          # coordinator.electric_heater_on
+    # v0.3.3 cold-start guards. `blind` means one or more model-critical
+    # datapoints are still seeded from the Store, so this interval must be
+    # accounted as unobserved rather than integrated. The two *_fresh flags
+    # gate the hardware-counter endpoints independently, because a stale
+    # endpoint corrupts Δ directly (see const.py "Cold-start readiness").
+    blind: bool = False
+    elec_fresh: bool = True
+    cycles_fresh: bool = True
 
 
 def classify_mode(s: Sample) -> str:
@@ -175,6 +186,7 @@ class _DayAccumulator:
     """In-progress aggregation of one local calendar day."""
     day: str
     observed_s: float = 0.0
+    unknown_s: float = 0.0          # v0.3.3 — mid-day time we could not observe
     mode_s: dict[str, float] = field(
         default_factory=lambda: {m: 0.0 for m in
                                  (MODE_SH, MODE_DHW, MODE_COOL, MODE_IDLE)})
@@ -193,6 +205,7 @@ class _DayAccumulator:
     def to_dict(self) -> dict[str, Any]:
         return {
             "day": self.day, "observed_s": self.observed_s,
+            "unknown_s": self.unknown_s,
             "mode_s": dict(self.mode_s), "heater_s": self.heater_s,
             "thermal_kwh": self.thermal_kwh, "carnot_sum": self.carnot_sum,
             "carnot_n": self.carnot_n, "suspect_n": self.suspect_n,
@@ -206,6 +219,7 @@ class _DayAccumulator:
     def from_dict(cls, d: dict[str, Any]) -> _DayAccumulator:
         acc = cls(day=str(d.get("day", "")))
         acc.observed_s   = float(d.get("observed_s", 0.0))
+        acc.unknown_s    = float(d.get("unknown_s", 0.0))
         stored_modes     = d.get("mode_s") or {}
         for m in acc.mode_s:
             acc.mode_s[m] = float(stored_modes.get(m, 0.0))
@@ -247,14 +261,32 @@ class HealthModel:
             self._last_ts = None    # never integrate across a day boundary
 
         acc = self._acc
-        # Interval since the previous sample of the SAME day, capped so a
-        # restart / outage gap is never integrated into time or energy.
+        # Interval since the previous sample of the SAME day. An over-long
+        # interval is never integrated — but it is no longer silently
+        # discarded either (v0.3.3): the hardware counters kept advancing
+        # while we were not looking, so that time is recorded as UNOBSERVED
+        # and weighed at day close. A negative step (clock adjustment) is
+        # dropped outright; it carries no reliable duration.
         dt_s = 0.0
         if self._last_ts is not None:
-            dt_s = s.ts - self._last_ts
-            if dt_s < 0.0 or dt_s > HEALTH_MAX_GAP_S:
+            raw = s.ts - self._last_ts
+            if raw < 0.0:
                 dt_s = 0.0
+            elif raw > HEALTH_MAX_GAP_S:
+                acc.unknown_s += raw
+                dt_s = 0.0
+            else:
+                dt_s = raw
         self._last_ts = s.ts
+
+        # Stale-restore blindness (v0.3.3): the tracker could not obtain a
+        # trustworthy view of the machine for this interval. Record the time
+        # as unobserved and integrate NOTHING — not thermal energy, not mode
+        # seconds, not counter endpoints. Half-trusting a seeded value is how
+        # a restart gets mistaken for a fault.
+        if s.blind:
+            acc.unknown_s += dt_s
+            return closed
 
         mode = classify_mode(s)
         acc.observed_s += dt_s
@@ -284,13 +316,13 @@ class HealthModel:
 
         # Hardware-counter endpoints. A decreasing counter (device swap /
         # rollover) poisons the whole day — flag it, never clamp it.
-        if s.elec_mwh is not None:
+        if s.elec_mwh is not None and s.elec_fresh:
             if acc.elec_first is None:
                 acc.elec_first = float(s.elec_mwh)
             elif float(s.elec_mwh) < acc.elec_first - 1e-9:
                 acc.counter_reset = True
             acc.elec_last = float(s.elec_mwh)
-        if s.cycles is not None:
+        if s.cycles is not None and s.cycles_fresh:
             c = int(s.cycles)
             if acc.cycles_first is None:
                 acc.cycles_first = c
@@ -322,6 +354,11 @@ class HealthModel:
 
         if acc.counter_reset:
             reject.append("counter_reset")
+        if acc.unknown_s > HEALTH_MAX_UNKNOWN_S:
+            # Structural mismatch, not a data-quantity complaint: Δ23009
+            # includes every kWh drawn during the unobserved window while
+            # thermal_kwh cannot, so PF is understated by construction.
+            reject.append("stale_restore")
         if acc.observed_s < HEALTH_MIN_COVERAGE_S:
             reject.append("insufficient_coverage")
         if sh_s < HEALTH_MIN_SH_S:
@@ -355,6 +392,7 @@ class HealthModel:
         record = {
             "day": acc.day,
             "observed_h": round(acc.observed_s / 3600.0, 2),
+            "unknown_h": round(acc.unknown_s / 3600.0, 3),
             "sh_h": round(sh_s / 3600.0, 2),
             "dhw_h": round(acc.mode_s[MODE_DHW] / 3600.0, 2),
             "cool_h": round(acc.mode_s[MODE_COOL] / 3600.0, 2),
@@ -623,6 +661,8 @@ class HealthTracker:
             f"{DOMAIN}_{entry.entry_id}_{HEALTH_STORE_SUFFIX}",
         )
         self._unsub = None
+        self._start_mono: float = 0.0   # v0.3.3 — settle-window reference
+        self._blind_logged = False
 
     async def async_start(self) -> None:
         try:
@@ -638,6 +678,7 @@ class HealthTracker:
                 "Hoval CAN health: could not load stored history (%s) — "
                 "starting fresh", err,
             )
+        self._start_mono = time.monotonic()
         self._unsub = async_track_time_interval(
             self.hass, self._tick,
             timedelta(seconds=HEALTH_SAMPLE_INTERVAL_S),
@@ -658,6 +699,27 @@ class HealthTracker:
         # guarantees the gap is not integrated when data resumes.
         if not self._coord.connected:
             return
+        # v0.3.3 cold-start readiness. Values seeded from the Store after a
+        # restart are indistinguishable from live ones via get_value(), so
+        # ask the coordinator which are still stale and refuse to integrate
+        # those intervals. See const.py "Cold-start readiness" for why the
+        # two tiers exist (a pure freshness gate deadlocks on a broadcast-
+        # on-change bus; a pure timer resumes fabricating data once it
+        # expires).
+        is_restored = self._coord.is_restored
+        blind = any(is_restored(d) for d in HEALTH_FRESH_REQUIRED)
+        if not blind and (time.monotonic() - self._start_mono) < HEALTH_SETTLE_S:
+            blind = any(is_restored(d) for d in HEALTH_SETTLE_REQUIRED)
+        if blind and not self._blind_logged:
+            self._blind_logged = True
+            _LOGGER.debug(
+                "Hoval CAN health: sampling blind — awaiting live frames for "
+                "restored datapoint(s); intervals recorded as unobserved"
+            )
+        elif not blind and self._blind_logged:
+            self._blind_logged = False
+            _LOGGER.debug("Hoval CAN health: inputs live, sampling resumed")
+
         local = now.astimezone()
         get = self._coord.get_value
         raw_prog = get(DP_HEATING_PROGRAM)
@@ -675,6 +737,9 @@ class HealthTracker:
             cycles=get(DP_WEZ_CYCLES),
             source_c=self._coord.source_temp_c,
             heater_on=self._coord.electric_heater_on,
+            blind=blind,
+            elec_fresh=not is_restored(DP_WEZ_ELEC_TOTAL),
+            cycles_fresh=not is_restored(DP_WEZ_CYCLES),
         )
         self.model.add_sample(sample)
         self._store.async_delay_save(self.model.to_dict, PERSIST_SAVE_DELAY_S)
@@ -686,5 +751,10 @@ class HealthTracker:
             "latest": dict(self.model.latest),
             "confidence": self.model.confidence(),
             "history_days": len(self.model.history),
+            "sampling_blind": self._blind_logged,
+            "open_day_unknown_s": (
+                round(self.model._acc.unknown_s, 1)
+                if self.model._acc is not None else None
+            ),
             "recent_days": self.model.history[-14:],
         }

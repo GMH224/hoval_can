@@ -1,7 +1,7 @@
 # Hoval CAN — Home Assistant Integration
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz)
-![Version](https://img.shields.io/badge/version-0.3.2-blue)
+![Version](https://img.shields.io/badge/version-0.3.3-blue)
 ![HA min version](https://img.shields.io/badge/HA-2023.1%2B-green)
 
 Local-push integration for Hoval heat pump systems with the **WLAN Gateway**. Connects to the proprietary CAN-BUS TCP stream on port 3113. No cloud, no Modbus module required. Strictly **read-only** — nothing is ever written to the bus.
@@ -290,12 +290,44 @@ temperature DpId 7 — divergence > 3 °C marks the sample sensor-suspect).
 DpId 2080 counts starts of the whole heat generator without a mode tag, so
 cycles are attributed by using only days that are almost purely space
 heating. A day enters the baseline only if **all** hold: ≥ 12 h of observed
-telemetry; ≥ 2 h SPACE_HEATING_ACTIVE; DHW + passive-cooling share < 5 %
+telemetry; **< 10 min of mid-day unobserved time** (restart blindness or
+sample gaps — see below); ≥ 2 h SPACE_HEATING_ACTIVE; DHW + passive-cooling share < 5 %
 (real status datapoints: DpId 2052 == 8, DpId 2051 == 9); electric heater
 never detected; Δ23009 ≥ 5 kWh (1 kWh counter quantisation); both counters
 monotone; ≥ 6 valid Carnot samples with < 50 % sensor-suspect; η inside the
 plausibility band (0.08–0.85). Rejected days are recorded with their reasons
 (visible on the Health Status attributes and in diagnostics) — never fudged.
+
+### Restarts and cold start (v0.3.3)
+
+After a Home Assistant restart the integration seeds several datapoints from
+its own store so the power sensors resolve immediately — but the CAN bus
+broadcasts on change, so a datapoint can carry a *pre-restart* value for
+many minutes until the device next sends it. Those seeded values are
+indistinguishable from live ones to an ordinary sensor read.
+
+For a model that **integrates over time** this matters: a stale
+"compressor at 40 %, 3.5 kW" snapshot would fabricate heat that was never
+produced, while Δ23009 and Δ2080 are device-side counters that advanced
+regardless of whether HA was listening. The result is a corrupted η paired
+with a *correct* cycle rate — exactly the decoupled pattern the T² fusion
+reads as a fault.
+
+The health sampler therefore asks the coordinator which datapoints are
+still store-seeded and refuses to integrate those intervals at all. They
+are recorded as **unobserved time** rather than silently dropped, because
+the counters kept running: if more than 10 minutes of a day is unobserved,
+Δ23009 includes energy the thermal integral cannot, so the day is rejected
+with reason `stale_restore` instead of entering the baseline understated.
+The same accounting catches plain outages and any sample gap over 15 min.
+
+Modulation and thermal power must always be live (they drive mode
+classification and the thermal integral); the status/temperature gates fall
+back to their seeded values after a one-hour settle window, since a
+broadcast-on-change bus never re-sends a value that genuinely has not
+changed. Blindness at the *start* of a day is harmless and not counted —
+the counter endpoints and the thermal integral then both begin at the first
+observed sample.
 
 ### Fusion and statuses
 
@@ -396,6 +428,36 @@ Live CAN data always overwrites a restored value the moment it arrives. A corrup
 ---
 
 ## Changelog
+
+### v0.3.3 — Cold-start / stale-restore protection for the health index
+- **Fixes a real defect** (inherited from known gap #9): after a restart the
+  health sampler integrated store-seeded values as if they were live
+  observations, fabricating (or missing) thermal energy for as long as the
+  CAN bus took to re-broadcast. Because the hardware counters are endpoint-
+  based and unaffected, this corrupted η while leaving the cycle rate
+  correct — the exact decoupled signature the T² model reads as a fault,
+  able to produce both false alarms and false reassurance.
+- New `coordinator.is_restored(dp_id)` exposes the existing, self-clearing
+  `_restored_dpids` tracking; the sampler marks such intervals **blind** and
+  integrates nothing — no thermal energy, no mode seconds, no counter
+  endpoints.
+- Blind and over-long intervals are now **accounted as unobserved time**
+  rather than discarded. A day with > 10 min unobserved is rejected with
+  reason `stale_restore`, because Δ23009 includes energy the thermal
+  integral cannot (a structural mismatch, not a data-quantity complaint).
+  This also covers plain HA outages, which the v0.3.2 gap cap silently
+  tolerated.
+- Two-tier readiness: modulation and thermal power must always be live; the
+  status/temperature gates additionally accept seeded values after a
+  one-hour settle window, so a broadcast-on-change bus cannot deadlock
+  sampling on a value that legitimately never changes.
+- New attributes: `last_day_unobserved_h` (Health Status), plus
+  `sampling_blind` and `open_day_unknown_s` in diagnostics.
+- Tests: cold-start groups in both suites, including an **end-to-end
+  reproduction of the defect** proving the pre-fix path integrates > 3 kWh
+  of phantom heat and qualifies silently, while the fixed path rejects.
+- Audit: `AUDIT_v0.3.3.md`, which also corrects an inaccurate claim in the
+  v0.3.2 audit about gap-cap coverage.
 
 ### v0.3.2 — Heat-pump health index (measured, self-referential) + confidence
 - **New entities:** Health Index T2, Health Status (enum), Health Confidence

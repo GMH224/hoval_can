@@ -994,6 +994,73 @@ def test_health_tracker():
            and tr2.model._acc.sh_sample_n == 2)
 
 
+
+def test_health_cold_start_gate():
+    """v0.3.3: the tracker must not integrate Store-seeded values."""
+    print("Health cold-start gate:")
+    import datetime as _dt
+    from hoval_can import health as H
+
+    _FakeStore._backing.clear()
+    co = _co()
+    co._connected = True
+    # Simulate a restart: every PERSISTENT_DPID seeded from the Store, so
+    # get_value() returns data but is_restored() flags all of it as stale.
+    co._data.update({
+        const.DP_STATUS_WW: 0, const.DP_STATUS_HC: 1,
+        const.DP_MODULATION: 40, const.DP_HEAT_GEN: 30.4,
+        const.DP_THERMAL_POWER: 3.5, const.DP_WEZ_ELEC_TOTAL: 5.0,
+        const.DP_WEZ_CYCLES: 1000, const.DP_FLOW_TEMP: 30.0,
+    })
+    co._restored_dpids = set(const.PERSISTENT_DPIDS)
+    expect("coordinator reports restored state",
+           co.is_restored(const.DP_MODULATION) is True
+           and co.is_restored(const.DP_FLOW_TEMP) is False)
+
+    tr = H.HealthTracker(types.SimpleNamespace(loop=None), _Entry(), co)
+    asyncio.run(tr.async_start())
+    t0 = _dt.datetime(2026, 1, 10, 12, 0, tzinfo=_dt.timezone.utc)
+    for k in range(13):                        # 1 h of blind ticks
+        tr._tick(t0 + _dt.timedelta(minutes=5 * k))
+    acc = tr.model._acc
+    expect("no phantom thermal energy while seeded", acc.thermal_kwh == 0.0)
+    expect("no SH seconds credited while seeded",
+           acc.mode_s[H.MODE_SH] == 0.0)
+    expect("blind time accounted", acc.unknown_s > 3000.0)
+    expect("no counter endpoint captured while seeded",
+           acc.elec_first is None and acc.cycles_first is None)
+
+    # A live frame for the FRESH_REQUIRED pair clears the gate even though
+    # the SETTLE_REQUIRED members are still seeded (settle window applies
+    # only while they remain restored and the window has not elapsed).
+    for dp in const.HEALTH_FRESH_REQUIRED + const.HEALTH_SETTLE_REQUIRED:
+        co._restored_dpids.discard(dp)
+    co._restored_dpids.discard(const.DP_WEZ_ELEC_TOTAL)
+    co._restored_dpids.discard(const.DP_WEZ_CYCLES)
+    tr._tick(t0 + _dt.timedelta(minutes=65))
+    tr._tick(t0 + _dt.timedelta(minutes=70))
+    expect("sampling resumes once live frames arrive",
+           tr.model._acc.mode_s[H.MODE_SH] > 0.0
+           and tr.model._acc.elec_first == 5.0)
+
+    # Settle tier: modulation/thermal live, a status still seeded → blind
+    # only until HEALTH_SETTLE_S elapses.
+    co._restored_dpids.add(const.DP_STATUS_WW)
+    tr2 = H.HealthTracker(types.SimpleNamespace(loop=None), _Entry(), co)
+    asyncio.run(tr2.async_start())
+    # tr2 restores the persisted model, so compare deltas, not absolutes.
+    sh_before = tr2.model._acc.mode_s[H.MODE_SH]
+    tr2._tick(t0 + _dt.timedelta(minutes=80))
+    tr2._tick(t0 + _dt.timedelta(minutes=85))
+    expect("settle tier blocks while window open",
+           tr2.model._acc.mode_s[H.MODE_SH] == sh_before)
+    tr2._start_mono -= const.HEALTH_SETTLE_S + 1     # expire the window
+    tr2._tick(t0 + _dt.timedelta(minutes=90))
+    tr2._tick(t0 + _dt.timedelta(minutes=95))
+    expect("settle tier releases after the window",
+           tr2.model._acc.mode_s[H.MODE_SH] > sh_before)
+
+
 def main():
     test_cop()
     test_decode()
@@ -1008,6 +1075,7 @@ def main():
     test_diagnostics()
     test_rates()
     test_health_tracker()
+    test_health_cold_start_gate()
     print()
     print("RESULT:", "ALL PASS" if not _fails else f"{len(_fails)} FAIL: {_fails}")
     sys.exit(1 if _fails else 0)
