@@ -3,19 +3,21 @@ from __future__ import annotations
 
 import logging
 
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
-from .coordinator import HovalCANCoordinator
+from .coordinator import HovalCANCoordinator, HovalConfigEntry
 from .health import HealthTracker
 
 _LOGGER = logging.getLogger(__name__)
 PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR]
 
+# HovalConfigEntry is defined in coordinator.py and re-exported here so the
+# entry-point module still advertises the integration's public typing surface.
+__all__ = ["HovalConfigEntry", "async_setup_entry", "async_unload_entry"]
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+
+async def async_setup_entry(hass: HomeAssistant, entry: HovalConfigEntry) -> bool:
     coordinator = HovalCANCoordinator(hass, entry)
     await coordinator.async_start()
     # Health tracker (v0.3.2): attached to the coordinator BEFORE the sensor
@@ -24,22 +26,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     health = HealthTracker(hass, entry, coordinator)
     await health.async_start()
     coordinator.health_tracker = health
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     # Entities are now subscribed to dispatcher signals — replay any state
     # restored from storage in coordinator.async_start() so it shows up
     # immediately instead of waiting for the next CAN broadcast.
     coordinator.async_replay_restored_signals()
-    # Reload on options change (e.g. new heater power) — RestoreEntity
-    # preserves all accumulated energy totals across the reload.
-    entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+    # NOTE (v0.4.0): no entry.add_update_listener() here. Reloading after an
+    # options change is owned by HovalCANOptionsFlow(OptionsFlowWithReload).
+    # Registering a listener *and* using a reloading config-flow helper is
+    # deprecated since HA 2026.6 and an error from HA 2026.12.
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: HovalConfigEntry) -> bool:
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
-        coordinator: HovalCANCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
+        coordinator = entry.runtime_data
         health: HealthTracker | None = getattr(
             coordinator, "health_tracker", None
         )
@@ -47,8 +50,3 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await health.async_stop()   # cancels timer + final Store save
         await coordinator.async_stop()
     return unloaded
-
-
-async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    _LOGGER.debug("Hoval CAN: options changed — reloading %s", entry.entry_id)
-    await hass.config_entries.async_reload(entry.entry_id)

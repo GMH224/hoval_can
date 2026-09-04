@@ -90,8 +90,14 @@ _mod("homeassistant.helpers.dispatcher",
      async_dispatcher_connect=lambda *a, **k: (lambda: None),
      _SENT=_SENT)
 _mod("homeassistant.helpers.entity", DeviceInfo=dict)
+# v0.4.0: DeviceInfo now comes from helpers.device_registry and platforms take
+# AddConfigEntryEntitiesCallback. Both legacy names stay stubbed so the harness
+# keeps working if a module is reverted mid-refactor.
+_mod("homeassistant.helpers.device_registry", DeviceInfo=dict)
 _mod("homeassistant.helpers.entity_platform",
-     AddEntitiesCallback=type("AddEntitiesCallback", (), {}))
+     AddEntitiesCallback=type("AddEntitiesCallback", (), {}),
+     AddConfigEntryEntitiesCallback=type(
+         "AddConfigEntryEntitiesCallback", (), {}))
 _mod("homeassistant.helpers.event",
      async_track_time_interval=lambda *a, **k: (lambda: None))
 _mod("homeassistant.helpers.restore_state",
@@ -812,8 +818,10 @@ def test_diagnostics():
         data = {"host": "1.2.3.4", "port": 3113}
         options = {const.CONF_HEATER_POWER: 3.0, const.CONF_COOLING_POWER: 100}
 
+    # v0.4.0: the coordinator lives on entry.runtime_data, not hass.data.
     fake_entry = FakeEntry2()
-    hass = types.SimpleNamespace(data={const.DOMAIN: {"e1": co}})
+    fake_entry.runtime_data = co
+    hass = types.SimpleNamespace(data={})
     result = asyncio.run(
         DG.async_get_config_entry_diagnostics(hass, fake_entry))
     expect("diag redacts entry host",
@@ -825,12 +833,16 @@ def test_diagnostics():
     expect("diag keeps port visible",
            result["coordinator"]["port"] == 3113)
 
-    # diagnostics handles missing coordinator gracefully
-    empty_hass = types.SimpleNamespace(data={const.DOMAIN: {}})
+    # diagnostics handles an unloaded entry gracefully: runtime_data is only
+    # set while the entry is loaded, so the attribute may be absent entirely.
+    empty_hass = types.SimpleNamespace(data={})
+    unloaded_entry = FakeEntry2()          # no runtime_data attribute
     res2 = asyncio.run(
-        DG.async_get_config_entry_diagnostics(empty_hass, fake_entry))
-    expect("diag handles missing coordinator",
+        DG.async_get_config_entry_diagnostics(empty_hass, unloaded_entry))
+    expect("diag handles unloaded entry (no runtime_data)",
            "error" in res2["coordinator"])
+    expect("diag still reports entry metadata when unloaded",
+           res2["entry"]["unique_id"] == "**REDACTED**")
 
     # diagnostic sensor native_value wiring
     from hoval_can import sensor as S

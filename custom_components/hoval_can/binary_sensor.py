@@ -6,21 +6,21 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import DOMAIN, connection_signal, heater_signal
-from .coordinator import HovalCANCoordinator
+from .coordinator import HovalCANCoordinator, HovalConfigEntry
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: HovalConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    coord: HovalCANCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coord: HovalCANCoordinator = entry.runtime_data
     async_add_entities([
         HovalElectricHeaterBinarySensor(coord, entry),
         HovalConnectivityBinarySensor(coord, entry),
@@ -63,6 +63,16 @@ class HovalElectricHeaterBinarySensor(BinarySensorEntity):
             configuration_url=f"http://{entry.data['host']}",
         )
 
+    @callback
+    def _async_signal_write_state(self) -> None:
+        """Dispatcher target: write state from the event loop.
+
+        MUST stay decorated with @callback -- see the note on the identically
+        named method in sensor.py. An undecorated function or lambda is run in
+        the executor thread pool and crashes on HA 2026.9.
+        """
+        self.async_write_ha_state()
+
     async def async_added_to_hass(self) -> None:
         for sig in (
             heater_signal(self._entry.entry_id),
@@ -70,8 +80,7 @@ class HovalElectricHeaterBinarySensor(BinarySensorEntity):
         ):
             self.async_on_remove(
                 async_dispatcher_connect(
-                    self.hass, sig,
-                    lambda: self.async_write_ha_state(),
+                    self.hass, sig, self._async_signal_write_state,
                 )
             )
 
@@ -116,11 +125,19 @@ class HovalConnectivityBinarySensor(BinarySensorEntity):
             configuration_url=f"http://{entry.data['host']}",
         )
 
+    @callback
+    def _async_signal_write_state(self) -> None:
+        """Dispatcher target: write state from the event loop.
+
+        MUST stay decorated with @callback -- see the note in sensor.py.
+        """
+        self.async_write_ha_state()
+
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass, connection_signal(self._entry.entry_id),
-                lambda: self.async_write_ha_state(),
+                self._async_signal_write_state,
             )
         )
 

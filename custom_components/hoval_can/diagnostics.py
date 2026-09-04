@@ -11,21 +11,19 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
-from .coordinator import HovalCANCoordinator
+from .coordinator import HovalCANCoordinator, HovalConfigEntry
 
 TO_REDACT = {"host", "unique_id"}
 
 
 async def async_get_config_entry_diagnostics(
-    hass: HomeAssistant, entry: ConfigEntry
+    hass: HomeAssistant, entry: HovalConfigEntry
 ) -> dict[str, Any]:
-    coord: HovalCANCoordinator | None = (
-        hass.data.get(DOMAIN, {}).get(entry.entry_id)
-    )
+    # runtime_data is only present while the entry is loaded; diagnostics can
+    # legitimately be requested for an entry that failed to set up.
+    coord: HovalCANCoordinator | None = getattr(entry, "runtime_data", None)
 
     entry_info = {
         "title": entry.title,

@@ -1,6 +1,7 @@
 # CLAUDE.md — Hoval CAN Integration Developer Context
 
-Version 0.3.3. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
+Version 0.4.0. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
+Minimum Home Assistant: 2025.12. Baseline validated against HA 2026.9.
 Read-only. TCP port 3113, proprietary CAN-BUS stream.
 Installation: Hoval UltraSource T comfort (13), 2020, R410A, B0/W35 13.3 kW,
 200 m borehole (analog Erdsonde gauges only — no CAN datapoint for brine temp).
@@ -281,9 +282,13 @@ self._restored_dpids: set[int] = set()
 ## Architecture
 
 ```
-__init__.py      Setup; replays restored signals post-platform-setup;
-                 options reload listener (preserves energy totals)
-config_flow.py   ConfigFlow (IP+port); OptionsFlow (heater, cooling [legacy],
+__init__.py      Setup; publishes the coordinator on entry.runtime_data
+                 (v0.4.0, was hass.data); replays restored signals
+                 post-platform-setup. NO options update listener — the
+                 reload is owned by OptionsFlowWithReload (see below).
+config_flow.py   ConfigFlow (IP+port, _abort_if_unique_id_configured with
+                 reload_on_update=False);
+                 OptionsFlowWithReload (heater, cooling [legacy],
                  source_temp, approach_k [v0.3.1], brine_pump, heating_pump,
                  standby)
 coordinator.py   TCP reader; frame parser; signals; Store-backed restart
@@ -362,9 +367,35 @@ strings.json / translations/en.json   Options UI (7 fields as of v0.3.1)
    a more robust passive-cooling detection than the current single-status read.
 
 ## Tests
-`python3 tests/test_protocol.py` and `python3 tests/test_health.py` — both
-standalone (stub HA, including a functional in-memory `Store` stub),
-exit 0 == pass.
+`python3 tests/run_all.py` runs all five suites (one subprocess each, since
+every suite installs its own `sys.modules` HA stubs). 317 checks, exit 0 == pass.
+Individually: `test_protocol`, `test_health`, `test_thread_safety`,
+`test_config_flow`, `test_lifecycle`. All standalone (stub HA, including a
+functional in-memory `Store` stub); only `voluptuous` is required, for the
+config-flow suite.
+
+### Invariants the v0.4.0 suites lock down
+
+**Dispatcher targets must be `@callback` (test_thread_safety).** HA infers a
+job type per dispatcher target: a coroutine is awaited, a `@callback` runs
+inline on the loop, and *anything else* becomes an executor job on a worker
+thread. A bare `lambda: self.async_write_ha_state()` therefore wrote entity
+state off-loop and raised `RuntimeError` on HA 2026.9. Never pass an
+undecorated callable to `async_dispatcher_connect`. Note the old
+`callback=lambda f: f` stub in test_protocol cannot detect this — the
+thread-safety suite installs a faithful stub that sets the real marker.
+
+**No config-entry update listener (test_config_flow).** Combining
+`add_update_listener` with a reloading config-flow helper is an error from
+HA 2026.12. `OptionsFlowWithReload` plus `reload_on_update=False` replaces it;
+both halves are required. These are AST-asserted so they cannot regress.
+
+**No runtime state in `hass.data` (test_config_flow, test_lifecycle).**
+Use `entry.runtime_data`. Read it as `getattr(entry, "runtime_data", None)`
+in diagnostics — the attribute is absent, not `None`, on an unloaded entry.
+
+**Unload must leak nothing (test_lifecycle).** Five consecutive setup/unload
+cycles assert zero surviving timers and zero live background tasks.
 
 test_health.py cold-start group (v0.3.3) reproduces the defect end-to-end:
 the same simulated restart day run with and without the fix, asserting the

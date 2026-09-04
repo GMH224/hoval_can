@@ -1,8 +1,9 @@
 # Hoval CAN — Home Assistant Integration
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz)
-![Version](https://img.shields.io/badge/version-0.3.3-blue)
-![HA min version](https://img.shields.io/badge/HA-2023.1%2B-green)
+![Version](https://img.shields.io/badge/version-0.4.0-blue)
+![HA min version](https://img.shields.io/badge/HA-2025.12%2B-green)
+![Tests](https://img.shields.io/badge/tests-317%20checks-brightgreen)
 
 Local-push integration for Hoval heat pump systems with the **WLAN Gateway**. Connects to the proprietary CAN-BUS TCP stream on port 3113. No cloud, no Modbus module required. Strictly **read-only** — nothing is ever written to the bus.
 
@@ -428,6 +429,46 @@ Live CAN data always overwrites a restored value the moment it arrives. A corrup
 ---
 
 ## Changelog
+
+### v0.4.0 — HA 2026.9 crash fix + 2026.12 lifecycle compliance
+
+**Upgrade recommended for anyone on HA 2026.9 or later.** Minimum supported
+Home Assistant is now **2025.12**.
+
+- **Fixes a crash that was occurring on every connection-state change.**
+  Entities subscribed to dispatcher signals with a bare
+  `lambda: self.async_write_ha_state()`. Home Assistant treats an undecorated
+  callable as a *blocking* job and runs it in the executor thread pool, so
+  `async_write_ha_state()` was reached from a `SyncWorker` thread — which
+  HA 2026.9 rejects with a `RuntimeError` for custom integrations. All three
+  targets (one of them in `HovalBaseEntity`, inherited by *every* sensor) are
+  now `@callback`-decorated bound methods that run on the event loop.
+- **Fixes a lifecycle pattern that becomes a hard error in HA 2026.12.**
+  The integration combined a config-entry update listener with a reloading
+  config-flow helper — deprecated since 2026.6. The listener and
+  `_async_reload_entry()` are removed, `HovalCANOptionsFlow` now subclasses
+  `OptionsFlowWithReload` so the framework owns the reload, and
+  `_abort_if_unique_id_configured()` is called with `reload_on_update=False`.
+  Options changes now trigger exactly one reload.
+- Runtime state moved from `hass.data` to **`ConfigEntry.runtime_data`** with a
+  typed `HovalConfigEntry` alias (ICS Bronze `runtime-data`). The coordinator's
+  lifetime is now exactly the entry's lifetime. Diagnostics degrade gracefully
+  when the entry is unloaded.
+- Modernised two import paths: `DeviceInfo` now comes from
+  `helpers.device_registry`, and platforms take
+  `AddConfigEntryEntitiesCallback`.
+- Manifest declares `"integration_type": "device"`; keys reordered for hassfest.
+  `hacs.json` minimum raised from `2023.1.0` (which had become a packaging bug —
+  it offered the integration to cores that cannot run it).
+- **Tests: 241 → 317 checks across 5 suites.** New `test_thread_safety.py`
+  reproduces the production crash, `test_config_flow.py` covers the flows plus
+  21 AST-based lifecycle contracts, and `test_lifecycle.py` proves five
+  consecutive setup/unload cycles leak no timers or tasks. Run everything with
+  `python3 tests/run_all.py`.
+- Audit: `AUDIT_v0.4.0.md`. It documents both defects and **corrects the
+  supplied 0.3.3 audit**, which concluded the code was clear of breaking
+  changes — it identified neither the crash nor the 2026.12 error, and
+  contradicted itself on whether `_abort_if_unique_id_configured()` was used.
 
 ### v0.3.3 — Cold-start / stale-restore protection for the health index
 - **Fixes a real defect** (inherited from known gap #9): after a restart the

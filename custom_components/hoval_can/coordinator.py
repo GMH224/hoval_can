@@ -45,6 +45,10 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Typed config entry (ICS `runtime-data` rule). Declared here so the
+# platform modules can import it without importing the package __init__.
+type HovalConfigEntry = ConfigEntry["HovalCANCoordinator"]
+
 # v0.3.2 optimisation (behaviour-neutral): value-field byte length for BE
 # frames precomputed once per process. STR and unmapped datapoints are absent
 # → .get() returns None, matching the previous per-frame branch chain exactly.

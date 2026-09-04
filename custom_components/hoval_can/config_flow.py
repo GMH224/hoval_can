@@ -8,7 +8,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant.config_entries import (
-    ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow,
+    ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlowWithReload,
 )
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import callback
@@ -64,7 +64,9 @@ class HovalCANConfigFlow(ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> HovalCANOptionsFlow:
-        return HovalCANOptionsFlow(config_entry)
+        # HA injects the entry; OptionsFlow.config_entry is a read-only
+        # property, so the handler must not be constructed with it.
+        return HovalCANOptionsFlow()
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -74,7 +76,11 @@ class HovalCANConfigFlow(ConfigFlow, domain=DOMAIN):
             host = user_input[CONF_HOST].strip()
             port = user_input.get(CONF_PORT, DEFAULT_PORT)
             await self.async_set_unique_id(f"{host}:{port}")
-            self._abort_if_unique_id_configured()
+            # reload_on_update=False is required from HA 2026.12: combining a
+            # reloading config-flow helper with a config-entry update listener
+            # is an error. The listener is gone (see __init__.py) and reloads
+            # on option changes are owned by OptionsFlowWithReload below.
+            self._abort_if_unique_id_configured(reload_on_update=False)
             if await _test_connection(host, port):
                 return self.async_create_entry(
                     title=f"Hoval CAN ({host})",
@@ -86,7 +92,7 @@ class HovalCANConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 
-class HovalCANOptionsFlow(OptionsFlow):
+class HovalCANOptionsFlow(OptionsFlowWithReload):
     """Options: electric heater rated power, passive-cooling pump power,
     ground-loop source temperature, COP approach temperature k (v0.3.1),
     brine/heating pump power, and standby power.
@@ -94,10 +100,12 @@ class HovalCANOptionsFlow(OptionsFlow):
     COP is calculated automatically from live sensor data — only the source
     (ground-loop) temperature it needs is configurable here, since no CAN
     datapoint reports it on this installation.
-    """
 
-    def __init__(self, config_entry: ConfigEntry) -> None:
-        self._config_entry = config_entry
+    Subclasses OptionsFlowWithReload: Home Assistant reloads the entry
+    itself once the options change, so the integration must not also register
+    a config-entry update listener (that combination is an error from
+    HA 2026.12).
+    """
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -105,7 +113,7 @@ class HovalCANOptionsFlow(OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        opts = self._config_entry.options
+        opts = self.config_entry.options
         current_heater = float(
             opts.get(CONF_HEATER_POWER, DEFAULT_HEATER_POWER_KW)
         )

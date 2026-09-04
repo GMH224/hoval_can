@@ -14,8 +14,8 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.restore_state import RestoreEntity
 
@@ -25,7 +25,7 @@ from .const import (
     connection_signal, cooling_signal, dp_signal, health_signal,
     heater_signal,
 )
-from .coordinator import HovalCANCoordinator
+from .coordinator import HovalCANCoordinator, HovalConfigEntry
 from .health import HEALTH_STATUS_OPTIONS, STATUS_INSUFF_BASELINE
 
 _LOGGER = logging.getLogger(__name__)
@@ -34,10 +34,10 @@ _ENERGY_INTERVAL = timedelta(seconds=60)
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: HovalConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    coord: HovalCANCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coord: HovalCANCoordinator = entry.runtime_data
     entities = []
     for desc in SENSOR_DESCRIPTIONS:
         cls = HovalPersistentSensor if desc.dp_id in PERSISTENT_DPIDS else HovalSensor
@@ -94,11 +94,25 @@ class HovalBaseEntity(SensorEntity):
         self._entry = entry
         self._attr_device_info = _device_info(entry)
 
+    @callback
+    def _async_signal_write_state(self) -> None:
+        """Dispatcher target: write state from the event loop.
+
+        MUST stay decorated with @callback. Home Assistant infers a job type
+        for every dispatcher target: a coroutine function is awaited, a
+        @callback is invoked inline on the event loop, and anything else is
+        treated as a blocking job and handed to the executor thread pool.
+        A plain function or lambda therefore reaches async_write_ha_state()
+        from a SyncWorker thread, which HA 2026.9 rejects with a RuntimeError
+        for custom integrations. See tests/test_thread_safety.py.
+        """
+        self.async_write_ha_state()
+
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass, connection_signal(self._entry.entry_id),
-                lambda: self.async_write_ha_state(),
+                self._async_signal_write_state,
             )
         )
 
