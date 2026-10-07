@@ -21,7 +21,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
     DOMAIN, PERSISTENT_DPIDS, SENSOR_DESCRIPTIONS,
-    DP_HEAT_GEN, DP_MODULATION, DP_THERMAL_POWER,
+    DP_HEAT_GEN, DP_MODULATION, DP_THERMAL_POWER, DP_OPMSG, MODEL_INPUT_DPIDS,
     connection_signal, cooling_signal, dp_signal, health_signal,
     heater_signal,
 )
@@ -510,13 +510,13 @@ class HovalPassiveCoolingEnergySensor(HovalBaseEntity, RestoreEntity):
 # ── Heat pump electrical: power ────────────────────────────────────────────
 
 class HovalHeatPumpElecPowerSensor(HovalBaseEntity):
-    """Instantaneous electrical power drawn by the heat pump compressor.
+    """Instantaneous electrical power of the heat pump compressor (kW).
 
-    Calculation: elec_kW = thermal_kW (DpId=29051) / COP(modulation, T_gen)
-
-    Updates on thermal power, modulation, or T_gen changes.
-    Returns 0.0 when COP=0 (heat pump not running).
-    Unknown until DpId=29051 is first received. 3-decimal precision.
+    v0.5.0: measured model (coordinator.compressor_elec_kw) — on/off from the
+    operating message (DpId 20053, ~75 s), level from the smart-meter
+    calibration (space heating flat, DHW over T_gen), pumps subtracted.
+    Attribute `model_in_range` is False while space heating runs above the
+    validated modulation (extrapolation). Unknown until on/off is known.
     """
     _attr_device_class               = SensorDeviceClass.POWER
     _attr_state_class                = SensorStateClass.MEASUREMENT
@@ -531,7 +531,7 @@ class HovalHeatPumpElecPowerSensor(HovalBaseEntity):
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
-        for dpid in (DP_THERMAL_POWER, DP_MODULATION, DP_HEAT_GEN):
+        for dpid in MODEL_INPUT_DPIDS:
             self.async_on_remove(
                 async_dispatcher_connect(
                     self.hass,
@@ -540,17 +540,14 @@ class HovalHeatPumpElecPowerSensor(HovalBaseEntity):
                 )
             )
 
+    @property
+    def extra_state_attributes(self):
+        return {"model_in_range": self._coord.model_in_range}
+
     @callback
     def _update(self) -> None:
-        thermal = self._coord.get_value(DP_THERMAL_POWER)
-        if thermal is None:
-            self._attr_native_value = None
-        else:
-            cop = self._coord.cop
-            self._attr_native_value = (
-                0.0 if (cop == 0.0 or thermal == 0.0)
-                else round(thermal / cop, 3)
-            )
+        kw = self._coord.compressor_elec_kw
+        self._attr_native_value = None if kw is None else round(kw, 3)
         self.async_write_ha_state()
 
 
@@ -581,8 +578,7 @@ class HovalHeatPumpElecEnergySensor(HovalBaseEntity, RestoreEntity):
         self._attr_unique_id    = f"{entry.entry_id}_heat_pump_electrical_energy"
         self._attr_name         = "Heat Pump Electrical Energy"
         self._total_kwh         = 0.0
-        self._last_thermal      = None
-        self._last_cop          = 0.0
+        self._last_kw: float | None = None
         self._last_ts: float | None = None
         self._attr_native_value = 0.0
 
@@ -598,7 +594,7 @@ class HovalHeatPumpElecEnergySensor(HovalBaseEntity, RestoreEntity):
                         _LOGGER.debug("Hoval CAN: restored hp_elec_energy=%.3f kWh", v)
                 except (ValueError, TypeError):
                     pass
-        for dpid in (DP_THERMAL_POWER, DP_MODULATION, DP_HEAT_GEN):
+        for dpid in MODEL_INPUT_DPIDS:
             self.async_on_remove(
                 async_dispatcher_connect(
                     self.hass,
@@ -624,9 +620,8 @@ class HovalHeatPumpElecEnergySensor(HovalBaseEntity, RestoreEntity):
         # On disconnect, discard the open interval so the next sample after a
         # reconnect does not integrate the entire downtime as one lump.
         if not self._coord.connected:
-            self._last_thermal = None
-            self._last_cop     = 0.0
-            self._last_ts      = None
+            self._last_kw = None
+            self._last_ts = None
 
     @callback
     def _update(self) -> None:
@@ -657,23 +652,19 @@ class HovalHeatPumpElecEnergySensor(HovalBaseEntity, RestoreEntity):
         to NTP/DST wall-clock steps that would otherwise lose energy
         (backward step) or over-count (forward step).
         """
-        thermal = self._coord.get_value(DP_THERMAL_POWER)
-        cop     = self._coord.cop
+        kw = self._coord.compressor_elec_kw   # v0.5.0 measured model
 
-        if (self._last_thermal is not None and self._last_ts is not None
-                and thermal is not None
-                and self._last_cop > 0.0 and self._last_thermal > 0.0):
+        if (self._last_kw is not None and self._last_ts is not None
+                and kw is not None and self._last_kw > 0.0):
             h = max(0.0, (now - self._last_ts) / 3600.0)
-            self._total_kwh += h * (self._last_thermal / self._last_cop)
+            self._total_kwh += h * self._last_kw
 
-        if thermal is not None:
-            self._last_thermal = thermal
-            self._last_cop     = cop
-            self._last_ts      = now
+        if kw is not None:
+            self._last_kw = kw
+            self._last_ts = now
         else:
-            self._last_thermal = None
-            self._last_cop     = 0.0
-            self._last_ts      = None
+            self._last_kw = None
+            self._last_ts = None
 
         displayed = round(self._total_kwh, 3)
         if write_always or displayed != self._attr_native_value:
@@ -707,6 +698,7 @@ class HovalBrinePumpPowerSensor(HovalBaseEntity):
         await super().async_added_to_hass()
         for sig in (
             dp_signal(self._entry.entry_id, DP_MODULATION),
+            dp_signal(self._entry.entry_id, DP_OPMSG),   # v0.5.0 on/off source
             cooling_signal(self._entry.entry_id),
         ):
             self.async_on_remove(
@@ -751,6 +743,7 @@ class HovalHeatingPumpPowerSensor(HovalBaseEntity):
         await super().async_added_to_hass()
         for sig in (
             dp_signal(self._entry.entry_id, DP_MODULATION),
+            dp_signal(self._entry.entry_id, DP_OPMSG),   # v0.5.0 on/off source
             cooling_signal(self._entry.entry_id),
         ):
             self.async_on_remove(
@@ -793,8 +786,8 @@ class HovalStandbyPowerSensor(HovalBaseEntity):
 # ── Total electrical: power ────────────────────────────────────────────────
 
 class HovalTotalElecPowerSensor(HovalBaseEntity):
-    """Total instantaneous electrical power: heat pump (compressor, via
-    measured thermal power / dynamic COP) + electric heater + brine pump +
+    """Total instantaneous electrical power: heat pump (compressor, v0.5.0
+    physics model calibrated on the smart meter) + electric heater + brine pump +
     heating-circuit pump + standby. Unknown inputs are treated as 0 (see
     `_update`), so the total reports known loads even before every datapoint
     has been broadcast; a dead/stalled link is surfaced via `available`.
@@ -814,9 +807,7 @@ class HovalTotalElecPowerSensor(HovalBaseEntity):
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         for sig in (
-            dp_signal(self._entry.entry_id, DP_THERMAL_POWER),
-            dp_signal(self._entry.entry_id, DP_MODULATION),
-            dp_signal(self._entry.entry_id, DP_HEAT_GEN),
+            *(dp_signal(self._entry.entry_id, d) for d in MODEL_INPUT_DPIDS),
             heater_signal(self._entry.entry_id),
             cooling_signal(self._entry.entry_id),
         ):
@@ -833,11 +824,8 @@ class HovalTotalElecPowerSensor(HovalBaseEntity):
         # broadcast yet (e.g. status_dhw stays dormant through long passive-
         # cooling spells on CAN). Treating that as 0 lets the total still report
         # known loads such as passive cooling instead of reading "unknown".
-        thermal   = self._coord.get_value(DP_THERMAL_POWER)
         heater_on = self._coord.electric_heater_on
-        cop       = self._coord.cop
-        hp_elec   = (0.0 if (thermal is None or thermal == 0.0 or cop == 0.0)
-                     else thermal / cop)
+        hp_elec   = self._coord.compressor_elec_kw or 0.0   # v0.5.0 model
         heater_elec = self._coord.heater_power_kw if heater_on else 0.0
         pumps_on    = bool(self._coord.pumps_active)  # None -> False (zero-fill)
         brine_elec   = self._coord.brine_pump_kw if pumps_on else 0.0
@@ -897,9 +885,7 @@ class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
                 except (ValueError, TypeError):
                     pass
         for sig in (
-            dp_signal(self._entry.entry_id, DP_THERMAL_POWER),
-            dp_signal(self._entry.entry_id, DP_MODULATION),
-            dp_signal(self._entry.entry_id, DP_HEAT_GEN),
+            *(dp_signal(self._entry.entry_id, d) for d in MODEL_INPUT_DPIDS),
             heater_signal(self._entry.entry_id),
             cooling_signal(self._entry.entry_id),
         ):
@@ -938,11 +924,8 @@ class HovalTotalElecEnergySensor(HovalBaseEntity, RestoreEntity):
         whenever the entity is available, so pump energy keeps integrating
         through passive-cooling spells when status_dhw is dormant.
         """
-        thermal   = self._coord.get_value(DP_THERMAL_POWER)
         heater_on = self._coord.electric_heater_on
-        cop       = self._coord.cop
-        hp_elec   = (0.0 if (thermal is None or thermal == 0.0 or cop == 0.0)
-                     else thermal / cop)
+        hp_elec   = self._coord.compressor_elec_kw or 0.0   # v0.5.0 model
         heater_elec = self._coord.heater_power_kw if heater_on else 0.0
         pumps_on    = bool(self._coord.pumps_active)
         brine_elec   = self._coord.brine_pump_kw if pumps_on else 0.0

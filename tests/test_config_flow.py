@@ -135,7 +135,7 @@ def test_manifest() -> None:
     print("Manifest:")
     import json
     m = json.load(open(os.path.join(COMPONENT, "manifest.json"), encoding="utf-8"))
-    check("version is 0.4.0", m.get("version") == "0.4.0", m.get("version"))
+    check("version is 0.5.0", m.get("version") == "0.5.0", m.get("version"))
     check("integration_type is declared", m.get("integration_type") == "device",
           m.get("integration_type"))
     keys = list(m)

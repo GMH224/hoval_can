@@ -176,8 +176,85 @@ DP_WEZ_ELEC_TOTAL  = 23009   # Hardware lifetime electricity  U32 dec=3 MWh
 DP_WEZ_CYCLES      = 2080    # WEZ Switch Cycles     U32 counter   ← health input
 DP_HEATING_PROGRAM = 502     # Active Heating Program STR          ← health gate
 
+DP_OPMSG           = 20053   # WEZ operating message U8 (1 = compressor running)
+                             # polled by the gateway every ~75 s ← v0.5.0 on/off source
+
 DHW_STATUS_CHARGING = 8
 HC_STATUS_PASSIVE_COOLING = 9   # status_heating_circuit value for passive cooling
+
+# ── Measured electrical model (v0.5.0) ──────────────────────────────────────
+# Calibrated against the house smart meter (inverter AC − grid meter, 20 s),
+# 29 compressor runs 23 Sep – 7 Oct 2026, UltraSource T comfort (13), constant
+# ~16.5 °C borehole. Values are TOTAL heat-pump draw INCLUDING the brine and
+# heating-circuit pumps; the compressor term is derived by subtracting the
+# configured pump wattages so Total Electrical Power reproduces the measurement
+# whatever the pump options are set to.
+#
+# Why not thermal / COP any more: DpId 29051 and 20052 are only polled every
+# ~15 min on this bus (passive observation), so runs were picked up late and
+# held after they ended; per-run error 0.4×–1.6×. DpId 20053 (operating
+# message) is polled every ~75 s and matches the real start/stop within ~1 min.
+#
+# Physics: P_el = Q_th(mod) / COP,  COP = η · T_cond / (T_cond − T_brine + Δ)
+#   Q_th(mod)  heat output, linear in compressor modulation. Anchored on the
+#              measured 7.1 kW at 30 % (16.5 °C brine) and the datasheet's
+#              modulation span 4.7–13.3 kW (×2.83) scaled by the same brine
+#              factor (7.1/4.7) → ~20 kW at 100 % (+0.186 kW per %). Fresh
+#              29051 polls agree (43 % → 9.1 kW, 55 % → 11.7 kW).
+#   COP        constant fraction of Carnot over the lift from brine to the
+#              heat-generator temperature (DpId 7, ~75 s), plus a lumped
+#              heat-exchanger approach Δ. η and Δ fitted on 42 fresh-poll
+#              meter points (space heating rmse 0.12 kW, DHW 0.64 kW) — they
+#              are only jointly meaningful (effective COP), not individually.
+#   Values are the TOTAL heat-pump draw incl. brine + heating pumps.
+# Backtest on 22 quiet runs (minute level): space heating −7 % (±0.10 kWh/run),
+# DHW+heater −3 % (±0.15 kWh/charge); old thermal/COP model −19 % / −8 %.
+# NOT identifiable from the Sep/Oct data: whether COP drops further at high
+# load (larger HX approach) and whether the brine sags during long high-load
+# runs (200 m borehole, ~50 W/m extraction at full power). Both would make the
+# real draw on cold days HIGHER than modelled → model_in_range flag above
+# SH_VALIDATED_MAX_MODULATION.
+MODEL_Q_AT_MIN_KW: float   = 7.1     # kW_th at 30 % modulation, 16.5 °C brine
+MODEL_Q_PER_PCT_KW: float  = 0.186   # kW_th per % modulation
+MODEL_MIN_MODULATION: float = 30.0   # % — lowest value ever observed running
+MODEL_ETA: float           = 0.795   # effective Carnot fraction (fitted)
+MODEL_APPROACH_K: float    = 22.3    # K, lumped approach (fitted, with η)
+SH_VALIDATED_MAX_MODULATION: float = 45.0
+# DHW: the controller holds ~70 % until T_gen ≈ 50 °C, then winds modulation
+# down to ~33 % by 55.5 °C (seen in all charges, incl. 1-min polls on 2 Oct).
+# Modulation itself is only polled every ~15 min, so during a charge it is
+# derived from T_gen (polled every ~75 s) via this controller curve.
+DHW_MODULATION_CURVE: tuple[tuple[float, float], ...] = ((50.0, 70.0), (55.5, 33.0))
+
+# Electric heater (Heizstab) — v0.5.0 rule. Only the weekly legionella/boost
+# charge (setpoint 62 °C, above what the heat pump can reach) uses it: the
+# controller charges with the compressor up to ~52 °C, stops it, and the heater
+# finishes the charge (measured 4.22–4.28 kW, 61 min, both Sundays). Normal
+# 47 °C charges keep status 8 for 3–15 min after the compressor stops with NO
+# heater — the old rule (compressor off + below setpoint) could misfire there.
+HEATER_BOOST_MIN_SETPOINT: float = 55.0   # °C — DHW setpoint beyond HP reach
+HEATER_LATCH_FALLBACK_DHW: float = 50.0   # °C — restart mid-charge: tank this
+                                          # warm ⇒ compressor phase already done
+
+
+def model_elec_kw(modulation: float, t_gen: float, t_brine: float) -> float:
+    """Total heat-pump electrical draw (kW, incl. pumps) from the v0.5.0
+    physics model. Caller guarantees the compressor is running."""
+    m = max(MODEL_MIN_MODULATION, float(modulation))
+    q = MODEL_Q_AT_MIN_KW + MODEL_Q_PER_PCT_KW * (m - MODEL_MIN_MODULATION)
+    lift = max(0.0, float(t_gen) - float(t_brine)) + MODEL_APPROACH_K
+    return q * lift / (MODEL_ETA * (float(t_gen) + 273.15))
+
+
+def interp_curve(x: float, curve) -> float:
+    """Piecewise-linear interpolation, clamped to the end values."""
+    if x <= curve[0][0]:
+        return curve[0][1]
+    for (x0, y0), (x1, y1) in zip(curve, curve[1:]):
+        if x <= x1:
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    return curve[-1][1]
+
 
 # ── Dynamic COP formula ───────────────────────────────────────────────────
 # Two-regime model using live temperature lift, with an approach-temperature
@@ -449,6 +526,10 @@ class HovalSensorDescription:
     icon: str | None = None
     entity_category: EntityCategory | None = None
     enabled_default: bool = True
+    # v0.5.0: (function group, function number) this value must come from.
+    # None = accept any source (pre-v0.5.0 behaviour). Set only where the
+    # same DpId is broadcast by several units and the values differ.
+    source: tuple[int, int] | None = None
 
 
 SDC = SensorDeviceClass
@@ -458,7 +539,8 @@ EC  = EntityCategory
 SENSOR_DESCRIPTIONS: tuple[HovalSensorDescription, ...] = (
     # ── Temperatures ──────────────────────────────────────────────────────
     HovalSensorDescription(0,   "outdoor_temp",
-        "Outdoor Temperature",             "S16", 1, "°C", SDC.TEMPERATURE, SC.MEASUREMENT),
+        "Outdoor Temperature",             "S16", 1, "°C", SDC.TEMPERATURE, SC.MEASUREMENT,
+        source=(0, 0)),   # v0.5.0: HC1 (1/0) and room unit (6/1) reuse DpId 0
     HovalSensorDescription(1,   "room_temp",
         "Room Temperature",                "S16", 1, "°C", SDC.TEMPERATURE, SC.MEASUREMENT),
     HovalSensorDescription(2,   "flow_temp",
@@ -485,7 +567,8 @@ SENSOR_DESCRIPTIONS: tuple[HovalSensorDescription, ...] = (
         "Compressor Modulation",           "U8",  0, "%",  None, SC.MEASUREMENT,
         "mdi:sine-wave"),
     HovalSensorDescription(29051, "current_heating_power",
-        "Current Heating Power",           "U32", 1, "kW", SDC.POWER, SC.MEASUREMENT),
+        "Current Heating Power",           "U32", 1, "kW", SDC.POWER, SC.MEASUREMENT,
+        source=(10, 1)),  # v0.5.0: HC1 (1/0) and DHW (2/0) send their own 29051
     HovalSensorDescription(23009, "total_wez_electrical_energy",
         "Total WEZ Electrical Energy",     "U32", 3, "MWh", SDC.ENERGY,
         SC.TOTAL_INCREASING),
@@ -558,7 +641,8 @@ SENSOR_DESCRIPTIONS: tuple[HovalSensorDescription, ...] = (
         "Active Heating Program",          "STR", 0, "",   None, None,
         "mdi:calendar-text"),
     HovalSensorDescription(4005, "circuit_name",
-        "Heating Circuit Name",            "STR", 0, "",   None, None, "mdi:label"),
+        "Heating Circuit Name",            "STR", 0, "",   None, None, "mdi:label",
+        source=(1, 0)),   # v0.5.0: DHW/WEZ/general also send 4005
 )
 
 SENSOR_BY_DPID: dict[int, HovalSensorDescription] = {
@@ -583,7 +667,15 @@ PERSISTENT_DPIDS: frozenset[int] = frozenset({
     DP_STATUS_HP, DP_STATUS_HC, DP_STATUS_WW,
     DP_MODULATION, DP_HEAT_GEN, DP_THERMAL_POWER,
     DP_DHW_ACTUAL, DP_DHW_SETPOINT,
+    DP_OPMSG,           # v0.5.0 — compressor on/off source for the power model
 })
+
+# v0.5.0: every DpId that feeds the electrical model / heater rule. Power and
+# energy sensors re-sample on any of them (plus heater/cooling signals).
+MODEL_INPUT_DPIDS: tuple[int, ...] = (
+    DP_OPMSG, DP_STATUS_WW, DP_HEAT_GEN, DP_MODULATION, DP_DHW_ACTUAL,
+    DP_DHW_SETPOINT,
+)
 
 # ── Coordinator-level persistent storage (HA Store helper) ─────────────────
 STORAGE_VERSION = 1

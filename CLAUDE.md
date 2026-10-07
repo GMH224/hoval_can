@@ -1,10 +1,31 @@
 # CLAUDE.md — Hoval CAN Integration Developer Context
 
-Version 0.4.0. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
+Version 0.5.0. Local-push HA integration for Hoval heat pumps via WLAN Gateway.
 Minimum Home Assistant: 2025.12. Baseline validated against HA 2026.9.
 Read-only. TCP port 3113, proprietary CAN-BUS stream.
 Installation: Hoval UltraSource T comfort (13), 2020, R410A, B0/W35 13.3 kW,
 200 m borehole (analog Erdsonde gauges only — no CAN datapoint for brine temp).
+
+---
+
+## v0.5.0 electrical model (supersedes "Dynamic COP" for all energy values)
+
+Calibrated against the house smart meter; see README changelog v0.5.0.
+- On/off: `heat_pump_active` = DpId 20053 == 1 (polled ~75 s); fallback modulation.
+- `coordinator.heat_pump_total_kw` → `const.model_elec_kw(mod, t_gen, source_temp)`;
+  `compressor_elec_kw` = total − brine − heating pump options. All HP/Total
+  power+energy sensors use it and subscribe to `MODEL_INPUT_DPIDS`.
+- DHW modulation from `DHW_MODULATION_CURVE(T_gen)`; SH from polled 20052, floored at 30.
+- Heater rule: status 8 & setpoint ≥ 55 & tank < setpoint & compressor off &
+  (`_dhw_compressor_ran` latch or tank ≥ 50 after restart).
+- Parser: `HovalSensorDescription.source=(fg, fn)` filters colliding DpIds
+  (group field = fg<<8 | fn; LE frames mask 0x8000).
+- Open: η/Δ are jointly fitted (only SH at 30–42 % in the data) — recalibrate
+  with a cold-spell export (outdoor < 5 °C, modulation > 45 %): same method,
+  minute series of house load vs. 20053 runs, fresh-poll points for the fit.
+- Bus facts (passive capture 3 Oct 2026): 23002/23003/84/85 never requested
+  by the gateway → unavailable passively; 29051/20052 polled every ~15 min;
+  7, 2053, 20053 every ~75 s; Hoval 23009 read ~1/3 below the meter.
 
 ---
 

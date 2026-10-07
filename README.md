@@ -430,6 +430,47 @@ Live CAN data always overwrites a restored value the moment it arrives. A corrup
 
 ## Changelog
 
+### v0.5.0 — Electrical model calibrated against the house smart meter
+
+Calibrated on 29 compressor runs (23 Sep – 7 Oct 2026) against the real house
+load (inverter AC − grid meter, 20 s), and replayed minute-by-minute through
+this code: **−5 % vs. the meter overall (v0.4.0: −12 %)**; space heating −7 %
+(±0.10 kWh/run, was −19 % / ±0.18), DHW incl. heater −3 % (±0.15 kWh/charge,
+was −8 % / ±0.47). Passive cooling is unchanged. Entity IDs are unchanged.
+
+- **Compressor on/off from the WEZ operating message (DpId 20053).** On this
+  bus 29051 (thermal power) and 20052 (modulation) are only polled every
+  ~15 min, so runs were detected up to 16 min late and estimated up to 11 min
+  past their end. 20053 is polled every ~75 s and matches the metered
+  start/stop within ~1 min. Modulation remains the fallback.
+- **Physics model replaces thermal ÷ COP.** P_el = Q_th(modulation) / COP,
+  COP = η·T_gen/(T_gen − T_brine + Δ). Q_th is linear in modulation (7.1 kW at
+  30 %, +0.186 kW/%, anchored on the datasheet span), T_brine is the existing
+  *Ground-Loop Source Temperature* option. Power rises with modulation and with
+  flow temperature (e.g. ~2.4 kW at 70 % / 35 °C). During DHW, modulation is
+  derived from T_gen via the observed controller curve (70 % → 33 % between
+  50 and 55.5 °C), because it falls continuously between the 15-min polls.
+  The model value includes the brine/heating pumps; the compressor term is
+  total − pump options, so the total matches the meter whatever they are set to.
+- **`model_in_range` attribute** on *Heat Pump Electrical Power*: false when
+  space heating runs above 45 % modulation — outside the measured envelope.
+  On cold days the real draw is more likely higher than modelled (COP may
+  fall further at high load; the brine may sag on long full-load runs).
+- **Heater (Heizstab) rule rewritten.** ON only during a DHW charge whose
+  setpoint is ≥ 55 °C (the weekly 62 °C boost), after the compressor has run
+  in that charge and stopped, until the tank reaches setpoint. Matched both
+  metered boosts (4.22–4.28 kW, 61 min) to ~1 min; removes the false ON at
+  charge start and on the 3–15 min tail of normal 47 °C charges. Set
+  *Electric Heater Rated Power* to the measured value (here 4.2 kW).
+- **Per-source datapoints.** The frame's group field is (function group,
+  function number); DpIds 29051 (HC1/DHW/heat pump), 0 (outdoor/HC1/room
+  unit) and 4005 now only accept their own source — fixes the 30-s drops of
+  Current Heating Power to 0 every 15 min and the ~1 °C outdoor jumps.
+  Rejected frames are counted in diagnostics (`source_mismatch_frames`).
+- Not changed (known): the *Power Limit* sensor (DpId 8) is actually the heat
+  generator return temperature on this bus (10/1/8); the *Dynamic COP*
+  sensor still shows the legacy model and no longer feeds any energy value.
+
 ### v0.4.0 — HA 2026.9 crash fix + 2026.12 lifecycle compliance
 
 **Upgrade recommended for anyone on HA 2026.9 or later.** Minimum supported

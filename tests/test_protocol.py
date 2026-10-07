@@ -434,6 +434,16 @@ def test_cooling_sensors():
             return self._cop
 
         @property
+        def compressor_elec_kw(self):
+            # v0.5.0 interface; the fake derives it from thermal/COP so the
+            # composition and integration arithmetic below stays unchanged.
+            if self.thermal is None:
+                return None
+            if self.thermal == 0.0 or self._cop == 0.0:
+                return 0.0
+            return self.thermal / self._cop
+
+        @property
         def electric_heater_on(self):
             return self.heater
 
@@ -537,6 +547,16 @@ def test_integrator_resample():
             return self._cop
 
         @property
+        def compressor_elec_kw(self):
+            # v0.5.0 interface; the fake derives it from thermal/COP so the
+            # composition and integration arithmetic below stays unchanged.
+            if self.thermal is None:
+                return None
+            if self.thermal == 0.0 or self._cop == 0.0:
+                return 0.0
+            return self.thermal / self._cop
+
+        @property
         def electric_heater_on(self):
             return self.heater
 
@@ -550,8 +570,7 @@ def test_integrator_resample():
     hp = object.__new__(S.HovalHeatPumpElecEnergySensor)
     hp._coord = fc
     hp._total_kwh = 0.0
-    hp._last_thermal = None
-    hp._last_cop = 0.0
+    hp._last_kw = None
     hp._last_ts = None
     hp._attr_native_value = 0.0
     hp.async_write_ha_state = lambda: None
@@ -584,7 +603,7 @@ def test_integrator_resample():
     # may be stale until the first fresh 29051 broadcast — only a dispatcher
     # signal may open an interval, matching pre-v0.3.1 semantics).
     fc.connected = True
-    hp._last_thermal, hp._last_cop, hp._last_ts = None, 0.0, None
+    hp._last_kw, hp._last_ts = None, None
     hp._tick(None)
     expect("HP: tick does not arm from cleared tracking", hp._last_ts is None)
 
@@ -1073,6 +1092,93 @@ def test_health_cold_start_gate():
            tr2.model._acc.mode_s[H.MODE_SH] > sh_before)
 
 
+def test_v050_model():
+    """v0.5.0: source filter, 20053 on/off, physics model, heater rule."""
+    print("== v0.5.0 measured/physics model ==")
+    OP, WW, TG, MOD = const.DP_OPMSG, const.DP_STATUS_WW, const.DP_HEAT_GEN, const.DP_MODULATION
+    DHW, SP = const.DP_DHW_ACTUAL, const.DP_DHW_SETPOINT
+
+    # -- source filter: 29051 only from the heat pump (10/1), outdoor from 0/0
+    co = _co()
+    co._consume_frames(_frame(BE, 0x0A01, 29051, struct.pack(">I", 72)))
+    co._consume_frames(_frame(BE, 0x0200, 29051, struct.pack(">I", 0)))
+    co._consume_frames(_frame(BE, 0x0100, 29051, struct.pack(">I", 0)))
+    approx("29051: DHW/HC zeros ignored, HP value kept", co.get_value(29051), 7.2)
+    co._consume_frames(_frame(BE, 0x0000, 0, struct.pack(">h", 161)))
+    co._consume_frames(_frame(BE, 0x0100, 0, struct.pack(">h", 172)))
+    approx("outdoor: HC1 DpId 0 ignored", co.get_value(0), 16.1)
+    expect("source mismatches counted", co._source_mismatch == 3)
+    co._consume_frames(_frame(BE, 0x0100, 2, struct.pack(">h", 280)))
+    approx("unfiltered DpId still accepted from any source", co.get_value(2), 28.0)
+
+    # -- on/off: operating message wins over (stale) modulation
+    co = _co()
+    expect("unknown on/off -> None", co.heat_pump_active is None
+           and co.compressor_elec_kw is None)
+    co._update_dp(MOD, 0.0)
+    expect("modulation fallback (no 20053 yet)", co.heat_pump_active is False)
+    co._update_dp(OP, 1)
+    expect("20053=1 -> running despite stale modulation 0", co.heat_pump_active is True)
+    co._update_dp(OP, 0); co._update_dp(MOD, 30.0)
+    expect("20053=0 -> off despite stale modulation 30", co.heat_pump_active is False)
+    approx("off -> 0 kW", co.compressor_elec_kw, 0.0)
+
+    # -- physics model: space heating, metered anchor ~1.0 kW at mod 30/T 29
+    co._update_dp(OP, 1); co._update_dp(TG, 29.0); co._update_dp(WW, 0)
+    approx("SH mod30 T29 total ~1.0 kW (metered 0.92-1.10)", co.heat_pump_total_kw, 1.01, 0.06)
+    approx("compressor = total - pumps (30+20 W)",
+           co.compressor_elec_kw, co.heat_pump_total_kw - 0.05, 0.001)
+    co._update_dp(MOD, 0.0)
+    approx("SH start before first poll: mod floored at 30", co.heat_pump_total_kw, 1.01, 0.06)
+    co._update_dp(MOD, 70.0); co._update_dp(TG, 35.0)
+    hi = co.heat_pump_total_kw
+    expect(f"SH power rises with modulation & flow (70%/35C -> {hi:.2f} kW)", 2.2 < hi < 2.7)
+    expect("mod 70 in SH flagged out of validated range", co.model_in_range is False)
+    co._update_dp(MOD, 40.0)
+    expect("mod 40 in range", co.model_in_range is True)
+    co2 = _co_with_options({const.CONF_SOURCE_TEMP: 12.0})
+    co2._update_dp(OP, 1); co2._update_dp(TG, 35.0); co2._update_dp(MOD, 40.0)
+    expect("colder brine -> more power", co2.heat_pump_total_kw > co.heat_pump_total_kw)
+
+    # -- DHW: modulation from T_gen controller curve (stale poll ignored)
+    co._update_dp(WW, 8); co._update_dp(MOD, 30.0)
+    co._update_dp(TG, 45.0); p45 = co.heat_pump_total_kw
+    co._update_dp(TG, 55.0); p55 = co.heat_pump_total_kw
+    expect(f"DHW early (T45, ~70%) ~3.3 kW (metered 3.3-3.6): {p45:.2f}", 2.9 < p45 < 3.8)
+    expect(f"DHW late (T55, ~35%) ~1.6-2.2 kW: {p55:.2f}", 1.4 < p55 < 2.3)
+    expect("DHW never flagged out of range", co.model_in_range is True)
+
+    # -- heater rule, replaying the 27 Sep 2026 boost
+    co = _co()
+    for dp, v in ((SP, 62.0), (DHW, 41.3), (WW, 0), (OP, 0)):
+        co._update_dp(dp, v)
+    co._update_dp(WW, 8)
+    expect("charge start, compressor not yet run -> no heater", co.electric_heater_on is False)
+    co._update_dp(OP, 1); co._update_dp(DHW, 50.0)
+    expect("compressor phase -> no heater", co.electric_heater_on is False)
+    co._update_dp(DHW, 52.4); co._update_dp(OP, 0)
+    expect("hand-over at 52 C -> heater ON", co.electric_heater_on is True)
+    co._update_dp(DHW, 62.0)
+    expect("setpoint reached -> heater OFF", co.electric_heater_on is False)
+    co._update_dp(WW, 0)
+    expect("latch cleared after charge", co._dhw_compressor_ran is False)
+
+    # normal 47 C charge: status stays 8 after compressor stop -> NO heater
+    co = _co()
+    for dp, v in ((SP, 47.0), (DHW, 40.0), (WW, 8), (OP, 1)):
+        co._update_dp(dp, v)
+    co._update_dp(OP, 0); co._update_dp(DHW, 46.9)
+    expect("47 C charge tail -> no heater", co.electric_heater_on is False)
+
+    # restart mid-boost: latch unknown, tank warm -> heater ON
+    co = _co()
+    for dp, v in ((SP, 62.0), (DHW, 55.0), (WW, 8), (OP, 0)):
+        co._data[dp] = v
+    expect("restart mid-boost (tank 55 C) -> heater ON", co.electric_heater_on is True)
+    co._data[DHW] = 42.0
+    expect("restart at charge start (tank 42 C) -> no heater", co.electric_heater_on is False)
+
+
 def main():
     test_cop()
     test_decode()
@@ -1088,6 +1194,7 @@ def main():
     test_rates()
     test_health_tracker()
     test_health_cold_start_gate()
+    test_v050_model()
     print()
     print("RESULT:", "ALL PASS" if not _fails else f"{len(_fails)} FAIL: {_fails}")
     sys.exit(1 if _fails else 0)

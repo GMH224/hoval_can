@@ -38,6 +38,10 @@ from .const import (
     DP_STATUS_HC, HC_STATUS_PASSIVE_COOLING, DP_STATUS_HP,
     DP_HEAT_GEN, DP_MODULATION, DHW_STATUS_CHARGING,
     COMPRESSOR_RUNNING_MODULATION,
+    DP_OPMSG, MODEL_INPUT_DPIDS, SH_VALIDATED_MAX_MODULATION,
+    DHW_MODULATION_CURVE, MODEL_MIN_MODULATION,
+    HEATER_BOOST_MIN_SETPOINT, HEATER_LATCH_FALLBACK_DHW,
+    interp_curve, model_elec_kw,
     PERSISTENT_DPIDS, PERSIST_SAVE_DELAY_S, STORAGE_VERSION,
     calculate_cop,
     connection_signal, cooling_signal, dp_signal, heater_signal,
@@ -109,6 +113,12 @@ class HovalCANCoordinator:
         self._stop       = False
         self._heater_on: bool | None = None
         self._cooling_on: bool | None = None
+        # v0.5.0: True once the compressor has run during the current DHW
+        # charge (status 8). The heater only ever follows a compressor phase.
+        self._dhw_compressor_ran: bool = False
+        # v0.5.0: frames dropped because their (group, number) did not match
+        # the sensor's expected source — surfaced in diagnostics.
+        self._source_mismatch: int = 0
         # ── Observability / diagnostics (read by the connectivity sensor) ──
         self._last_data_mono: float = 0.0   # monotonic ts of last decoded dp
         self._reconnect_count: int  = 0     # successful (re)connects after 1st
@@ -230,14 +240,69 @@ class HovalCANCoordinator:
 
     @property
     def heat_pump_active(self) -> bool | None:
-        """True when the compressor is drawing (modulation above the
-        "running" threshold). None until DpId 20052 has been seen even once —
-        distinct from "known off", so callers don't silently coerce an unseen
-        state into 0."""
+        """True when the compressor is running.
+
+        v0.5.0: primary source is the WEZ operating message (DpId 20053,
+        1 = running), which the gateway polls every ~75 s and which matched
+        the metered start/stop within ~1 min. Modulation (20052) is only
+        polled every ~15 min, so it is now a fallback for installations that
+        never send 20053. None until either has been seen."""
+        op = self._data.get(DP_OPMSG)
+        if op is not None:
+            return int(op) == 1
         m = self._data.get(DP_MODULATION)
         if m is None:
             return None
         return float(m) > COMPRESSOR_RUNNING_MODULATION
+
+    @property
+    def heat_pump_total_kw(self) -> float | None:
+        """Physics-model total heat-pump draw INCLUDING pumps (kW), v0.5.0.
+
+        Q_th from modulation, COP from the lift brine → heat generator (see
+        const.model_elec_kw). Modulation: space heating uses the last polled
+        value (≥ 30 %, also covering the first minutes of a run before the
+        next 15-min poll); DHW derives it from T_gen via the observed
+        controller curve, because it falls continuously between polls.
+        0 when the compressor is off; None while on/off is unknown."""
+        active = self.heat_pump_active
+        if active is None:
+            return None
+        if not active:
+            return 0.0
+        t_gen_raw = self._data.get(DP_HEAT_GEN)
+        if self._data.get(DP_STATUS_WW) == DHW_STATUS_CHARGING:
+            t_gen = float(t_gen_raw) if t_gen_raw is not None else 50.0
+            mod = interp_curve(t_gen, DHW_MODULATION_CURVE)
+        else:
+            t_gen = float(t_gen_raw) if t_gen_raw is not None else 30.0
+            mod = float(self._data.get(DP_MODULATION) or MODEL_MIN_MODULATION)
+        return model_elec_kw(mod, t_gen, self.source_temp_c)
+
+    @property
+    def compressor_elec_kw(self) -> float | None:
+        """Compressor-only electrical power (kW), v0.5.0.
+
+        Measured total minus the configured pump wattages, which the pump
+        sensors add back while `pumps_active` — so Total Electrical Power
+        equals the metered value regardless of the pump options."""
+        total = self.heat_pump_total_kw
+        if total is None:
+            return None
+        if total == 0.0:
+            return 0.0
+        return max(0.0, total - self.brine_pump_kw - self.heating_pump_kw)
+
+    @property
+    def model_in_range(self) -> bool:
+        """False when space heating runs at a modulation above what the
+        measured model was validated for (extrapolation — e.g. cold spells)."""
+        if not self.heat_pump_active:
+            return True
+        if self._data.get(DP_STATUS_WW) == DHW_STATUS_CHARGING:
+            return True
+        m = self._data.get(DP_MODULATION)
+        return m is None or float(m) <= SH_VALIDATED_MAX_MODULATION
 
     @property
     def pumps_active(self) -> bool | None:
@@ -383,6 +448,11 @@ class HovalCANCoordinator:
                 "electric_heater_on": self.electric_heater_on,
                 "passive_cooling_on": self.passive_cooling_on,
                 "heat_pump_active": self.heat_pump_active,
+                "heat_pump_total_kw": self.heat_pump_total_kw,
+                "compressor_elec_kw": self.compressor_elec_kw,
+                "model_in_range": self.model_in_range,
+                "dhw_compressor_ran": self._dhw_compressor_ran,
+                "source_mismatch_frames": self._source_mismatch,
                 "pumps_active": self.pumps_active,
             },
             "datapoints_seen": len(self._data),
@@ -391,40 +461,35 @@ class HovalCANCoordinator:
 
     @property
     def electric_heater_on(self) -> bool | None:
-        """True when the Heizstab is active (derived — no direct DpId).
+        """True when the Heizstab is active (derived — no direct DpId). v0.5.0.
 
-        ON when all of:
+        Calibrated on two metered boosts (4.22–4.28 kW, 61 min each). ON when
+        all of:
           1. DHW charging (status_ww == 8)
-          2. DHW below setpoint
-          3. Generator ≤ DHW + 5 °C  (heat pump generator not hot), AND
-          4. the compressor is not running (modulation ≤ 1 %).
-
-        Condition 4 reflects DHW priority: a single compressor cannot heat the
-        house and the DHW tank at the same time (3-way diverter / DHW takes
-        priority), so while the tank is charging, any compressor modulation
-        means the heat pump itself is doing the heating and the Heizstab is off.
-        The Heizstab only finishes the charge once the heat pump has stopped
-        (modulation = 0). This removes the false ON pulses that condition 3
-        alone produced while the compressor ramped up and the generator
-        temperature still lagged below the tank.
-
-        Missing modulation is treated as 0 (compressor off), preserving the
-        original behaviour until that DpId is first seen.
+          2. setpoint ≥ HEATER_BOOST_MIN_SETPOINT (55 °C) — only the boost
+             charge (62 °C) targets beyond what the heat pump reaches; normal
+             47 °C charges never use the heater
+          3. tank below setpoint
+          4. compressor not running (DHW priority: the controller hands over
+             from compressor to heater at ~52 °C)
+          5. the compressor already ran in this charge (latch) — removes the
+             false ON during the 1–3 min compressor ramp at charge start.
+             After a restart mid-charge the latch is unknown, so a tank at
+             ≥ HEATER_LATCH_FALLBACK_DHW (50 °C) is accepted instead.
         """
         status_ww  = self._data.get(DP_STATUS_WW)
         dhw_actual = self._data.get(DP_DHW_ACTUAL)
         dhw_sp     = self._data.get(DP_DHW_SETPOINT)
-        heat_gen   = self._data.get(DP_HEAT_GEN)
-        if None in (status_ww, dhw_actual, dhw_sp, heat_gen):
+        if None in (status_ww, dhw_actual, dhw_sp):
             return None
-        modulation = self._data.get(DP_MODULATION) or 0.0
-        compressor_running = modulation > COMPRESSOR_RUNNING_MODULATION
-        return bool(
-            status_ww == DHW_STATUS_CHARGING
-            and dhw_actual < dhw_sp
-            and heat_gen <= dhw_actual + HEATER_DETECTION_MARGIN
-            and not compressor_running
-        )
+        if status_ww != DHW_STATUS_CHARGING:
+            return False
+        if dhw_sp < HEATER_BOOST_MIN_SETPOINT or dhw_actual >= dhw_sp:
+            return False
+        if self.heat_pump_active:
+            return False
+        return bool(self._dhw_compressor_ran
+                    or dhw_actual >= HEATER_LATCH_FALLBACK_DHW)
 
     @property
     def passive_cooling_on(self) -> bool | None:
@@ -500,9 +565,7 @@ class HovalCANCoordinator:
         """
         for dp_id in self._restored_dpids:
             async_dispatcher_send(self.hass, self._dp_signal(dp_id))
-        if self._restored_dpids & {
-            DP_STATUS_WW, DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_HEAT_GEN, DP_MODULATION,
-        }:
+        if self._restored_dpids & set(MODEL_INPUT_DPIDS):
             async_dispatcher_send(self.hass, self._heater_signal)
         if DP_STATUS_HC in self._restored_dpids or DP_STATUS_HP in self._restored_dpids:
             async_dispatcher_send(self.hass, self._cooling_signal)
@@ -763,6 +826,14 @@ class HovalCANCoordinator:
         desc = SENSOR_BY_DPID.get(dp_id)
         if desc is None:
             return
+        # v0.5.0: the group field is (function group << 8 | function number).
+        # Several units broadcast the same DpId (e.g. 29051 from heating
+        # circuit, DHW and heat pump) — keep only the declared source.
+        if desc.source is not None:
+            g = group & 0x7FFF
+            if (g >> 8, g & 0xFF) != desc.source:
+                self._source_mismatch += 1
+                return
 
         if desc.typename == "STR":
             try:
@@ -810,8 +881,8 @@ class HovalCANCoordinator:
             self._restored_dpids.discard(dp_id)
             self._schedule_persist()
 
-        if dp_id in (DP_STATUS_WW, DP_DHW_ACTUAL, DP_DHW_SETPOINT, DP_HEAT_GEN,
-                     DP_MODULATION):
+        if dp_id in MODEL_INPUT_DPIDS:
+            self._update_dhw_latch()
             new_state = self.electric_heater_on
             if new_state != self._heater_on:
                 self._heater_on = new_state
@@ -822,6 +893,13 @@ class HovalCANCoordinator:
             if new_cooling != self._cooling_on:
                 self._cooling_on = new_cooling
                 async_dispatcher_send(self.hass, self._cooling_signal)
+
+    def _update_dhw_latch(self) -> None:
+        """Maintain 'compressor ran during this DHW charge' (v0.5.0)."""
+        if self._data.get(DP_STATUS_WW) != DHW_STATUS_CHARGING:
+            self._dhw_compressor_ran = False
+        elif self.heat_pump_active:
+            self._dhw_compressor_ran = True
 
     def _set_connected(self, state: bool) -> None:
         if state != self._connected:
